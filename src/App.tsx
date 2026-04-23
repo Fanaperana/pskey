@@ -95,6 +95,43 @@ const SESSION_TTL_MS = 30_000;
 const PIN_LEN = 4;
 const CHALLENGE_ROTATE_MS = 30_000;
 
+const BUSY_PHRASES = [
+  "Cooking",
+  "Computing",
+  "Fetching",
+  "Crunching",
+  "Whisking",
+  "Brewing",
+  "Hashing",
+  "Churning",
+  "Vibing",
+  "Summoning",
+  "Decrypting",
+  "Unscrambling",
+  "Untangling",
+  "Mixing the salt",
+  "Derivating",
+  "Lockpicking",
+  "Argon-ing",
+  "Grinding",
+  "Locking in",
+  "Simmering",
+  "Stirring the pot",
+  "Baking",
+  "Plotting",
+  "Deciphering",
+  "Mining bits",
+  "Shuffling",
+  "Calibrating",
+  "Reticulating splines",
+];
+
+function pickBusyPhrase(): string {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return BUSY_PHRASES[buf[0] % BUSY_PHRASES.length];
+}
+
 /** Generate a 4-char challenge: 3 digits + 1 letter A-Z at a random slot. */
 function generateChallenge(): string {
   const buf = new Uint32Array(5);
@@ -142,6 +179,8 @@ function App() {
     () => Date.now() + CHALLENGE_ROTATE_MS
   );
   const [challengeTick, setChallengeTick] = useState(0);
+  const [busyPhrase, setBusyPhrase] = useState<string | null>(null);
+  const [busyDots, setBusyDots] = useState(0);
 
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [actionPin, setActionPin] = useState("");
@@ -189,9 +228,11 @@ function App() {
   useEffect(() => {
     if (phase !== "setup" || setupPin.length !== PIN_LEN) return;
     setUnlockStatus("busy");
+    setBusyPhrase(pickBusyPhrase());
     invoke<UnlockResult>("vault_init", { pin: setupPin })
       .then((r) => {
         setUnlockStatus(null);
+        setBusyPhrase(null);
         setToken(r.token);
         setEntries(r.entries);
         setExpiresAt(Date.now() + r.expires_in_ms);
@@ -200,6 +241,7 @@ function App() {
       })
       .catch((e) => {
         setUnlockStatus(null);
+        setBusyPhrase(null);
         setUnlockError(String(e));
         setSetupPin("");
       });
@@ -208,11 +250,13 @@ function App() {
   useEffect(() => {
     if (phase !== "locked" || unlockPin.length !== PIN_LEN) return;
     setUnlockStatus("busy");
+    setBusyPhrase(pickBusyPhrase());
     invoke<UnlockResult>("vault_unlock_challenge", {
       input: { challenge, response: unlockPin.toUpperCase() },
     })
       .then((r) => {
         setUnlockStatus("valid");
+        setBusyPhrase(null);
         window.setTimeout(() => {
           setToken(r.token);
           setEntries(r.entries);
@@ -225,6 +269,7 @@ function App() {
       })
       .catch((e) => {
         setUnlockStatus("invalid");
+        setBusyPhrase(null);
         setUnlockError(String(e));
         window.setTimeout(() => {
           setUnlockPin("");
@@ -255,6 +300,14 @@ function App() {
       setChallengeExpiresAt(Date.now() + CHALLENGE_ROTATE_MS);
     }
   }, [phase]);
+
+  // Animate the "…" on the busy view.
+  useEffect(() => {
+    if (!busyPhrase) return;
+    setBusyDots(0);
+    const iv = window.setInterval(() => setBusyDots((d) => (d + 1) % 4), 250);
+    return () => window.clearInterval(iv);
+  }, [busyPhrase]);
 
   const filtered = entries.filter((e) =>
     e.title.toLowerCase().includes(search.toLowerCase())
@@ -511,6 +564,30 @@ function App() {
       {unlockError && (
         <span className="text-[9px] text-destructive">{unlockError}</span>
       )}
+    </div>
+  );
+
+  const busyView = (
+    <div className="px-2.5 py-5 flex flex-col items-center gap-2">
+      <div className="flex gap-1">
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className={cn(
+              "size-1.5 rounded-full bg-primary transition-opacity",
+              busyDots > i ? "opacity-100" : "opacity-25"
+            )}
+          />
+        ))}
+      </div>
+      <span className="text-[10px] font-semibold text-foreground tracking-wide">
+        {busyPhrase ?? "Working"}
+        {".".repeat(busyDots)}
+        <span className="opacity-0">{".".repeat(3 - busyDots)}</span>
+      </span>
+      <span className="text-[8px] text-muted-foreground">
+        deriving key (Argon2id)
+      </span>
     </div>
   );
 
@@ -985,8 +1062,8 @@ function App() {
           …
         </div>
       )}
-      {phase === "setup" && setupView}
-      {phase === "locked" && lockedView}
+      {phase === "setup" && (busyPhrase ? busyView : setupView)}
+      {phase === "locked" && (busyPhrase ? busyView : lockedView)}
       {phase === "unlocked" && view === "list" && listView}
       {phase === "unlocked" && view === "add" && addView}
       {phase === "unlocked" && view === "settings" && settingsView}
