@@ -34,7 +34,7 @@ function MaskedOTPSlot({
   ...props
 }: React.ComponentProps<"div"> & {
   index: number;
-  status?: "valid" | "invalid" | null;
+  status?: "valid" | "invalid" | "busy" | null;
 }) {
   const ctx = React.useContext(OTPInputContext);
   const { char, hasFakeCaret, isActive } = ctx?.slots[index] ?? {};
@@ -43,6 +43,8 @@ function MaskedOTPSlot({
       ? "border-green-500 ring-1 ring-green-500/40"
       : status === "invalid"
       ? "border-red-500 ring-1 ring-red-500/40"
+      : status === "busy"
+      ? "border-primary/60 ring-1 ring-primary/30 animate-pulse"
       : "";
   return (
     <div
@@ -130,9 +132,9 @@ function App() {
   const [newCustomPin, setNewCustomPin] = useState("");
 
   const [unlockPin, setUnlockPin] = useState("");
-  const [unlockStatus, setUnlockStatus] = useState<"valid" | "invalid" | null>(
-    null
-  );
+  const [unlockStatus, setUnlockStatus] = useState<
+    "valid" | "invalid" | "busy" | null
+  >(null);
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [setupPin, setSetupPin] = useState("");
   const [challenge, setChallenge] = useState(() => generateChallenge());
@@ -186,8 +188,10 @@ function App() {
 
   useEffect(() => {
     if (phase !== "setup" || setupPin.length !== PIN_LEN) return;
+    setUnlockStatus("busy");
     invoke<UnlockResult>("vault_init", { pin: setupPin })
       .then((r) => {
+        setUnlockStatus(null);
         setToken(r.token);
         setEntries(r.entries);
         setExpiresAt(Date.now() + r.expires_in_ms);
@@ -195,6 +199,7 @@ function App() {
         setPhase("unlocked");
       })
       .catch((e) => {
+        setUnlockStatus(null);
         setUnlockError(String(e));
         setSetupPin("");
       });
@@ -202,6 +207,7 @@ function App() {
 
   useEffect(() => {
     if (phase !== "locked" || unlockPin.length !== PIN_LEN) return;
+    setUnlockStatus("busy");
     invoke<UnlockResult>("vault_unlock_challenge", {
       input: { challenge, response: unlockPin.toUpperCase() },
     })

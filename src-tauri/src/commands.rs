@@ -133,7 +133,7 @@ pub fn vault_exists(state: State<AppState>) -> bool {
 }
 
 #[tauri::command]
-pub fn vault_init(pin: String, state: State<AppState>) -> Result<UnlockResult, String> {
+pub async fn vault_init(pin: String, state: State<'_, AppState>) -> Result<UnlockResult, String> {
     if state.vault_file.exists() {
         return Err("vault already exists".into());
     }
@@ -163,7 +163,7 @@ pub fn vault_init(pin: String, state: State<AppState>) -> Result<UnlockResult, S
 }
 
 #[tauri::command]
-pub fn vault_unlock(pin: String, state: State<AppState>) -> Result<UnlockResult, String> {
+pub async fn vault_unlock(pin: String, state: State<'_, AppState>) -> Result<UnlockResult, String> {
     {
         let inner = state.inner.lock();
         if let Some(until) = inner.locked_until {
@@ -308,9 +308,9 @@ fn candidates_from_challenge(challenge: &str, response: &str) -> Result<Vec<Stri
 }
 
 #[tauri::command]
-pub fn vault_unlock_challenge(
+pub async fn vault_unlock_challenge(
     input: ChallengeUnlockInput,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<UnlockResult, String> {
     {
         let inner = state.inner.lock();
