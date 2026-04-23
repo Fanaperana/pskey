@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="public/hero.png" alt="PSKey" width="220" />
+
 # 🔐 PSKey
 
 **A tiny, transparent, always-on-top password manager widget.**
