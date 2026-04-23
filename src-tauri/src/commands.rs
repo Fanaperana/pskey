@@ -213,6 +213,149 @@ pub fn vault_lock(state: State<AppState>) {
     inner.session = None;
 }
 
+// ─── Challenge-response unlock ───
+//
+// Frontend shows a 4-char "challenge" above the OTP. User types a 4-char
+// "response" computed per-slot from their PIN:
+//
+//   challenge[i] is digit 0-9  →  response[i] = base19(pin[i] + challenge[i])
+//   challenge[i] is letter A-Z →  response[i] = challenge[i]   (PIN digit masked)
+//
+// base19 alphabet: 0..9, A..I (10..18).
+//
+// To avoid huge brute-force over masked PIN digits, the frontend SHOULD limit
+// the number of letter slots in the challenge. This command refuses challenges
+// with more than `MAX_CHALLENGE_LETTERS` letters.
+
+const MAX_CHALLENGE_LETTERS: usize = 1;
+
+#[derive(Deserialize)]
+pub struct ChallengeUnlockInput {
+    challenge: String,
+    response: String,
+}
+
+fn base19_decode(c: char) -> Option<u32> {
+    let c = c.to_ascii_uppercase();
+    match c {
+        '0'..='9' => c.to_digit(10),
+        'A'..='I' => Some(10 + (c as u32 - 'A' as u32)),
+        _ => None,
+    }
+}
+
+/// Decode (challenge, response) into a list of candidate PIN strings.
+/// Returns Err on malformed input.
+fn candidates_from_challenge(challenge: &str, response: &str) -> Result<Vec<String>, String> {
+    let ch: Vec<char> = challenge.chars().collect();
+    let rs: Vec<char> = response.chars().collect();
+    if ch.len() != 4 || rs.len() != 4 {
+        return Err("challenge/response must be 4 chars".into());
+    }
+
+    // Per-slot: either (fixed digit, Some(d)) or (letter mask, None).
+    let mut slots: Vec<Option<u32>> = Vec::with_capacity(4);
+    let mut letter_count = 0usize;
+
+    for i in 0..4 {
+        let c = ch[i];
+        let r = rs[i];
+        if c.is_ascii_digit() {
+            let cn = c.to_digit(10).unwrap();
+            let rn = base19_decode(r).ok_or("invalid response char")?;
+            let pd = (rn + 19 - cn) % 19;
+            if pd >= 10 {
+                return Err("invalid response".into());
+            }
+            slots.push(Some(pd));
+        } else if c.is_ascii_alphabetic() {
+            if r.to_ascii_uppercase() != c.to_ascii_uppercase() {
+                return Err("invalid response".into());
+            }
+            letter_count += 1;
+            slots.push(None);
+        } else {
+            return Err("invalid challenge char".into());
+        }
+    }
+    if letter_count > MAX_CHALLENGE_LETTERS {
+        return Err("challenge has too many letters".into());
+    }
+
+    // Enumerate candidates (cartesian product over unknown slots).
+    let mut out: Vec<String> = vec![String::with_capacity(4)];
+    for slot in slots {
+        match slot {
+            Some(d) => {
+                for s in out.iter_mut() {
+                    s.push(char::from_digit(d, 10).unwrap());
+                }
+            }
+            None => {
+                let mut next = Vec::with_capacity(out.len() * 10);
+                for s in &out {
+                    for d in 0..10u32 {
+                        let mut ns = s.clone();
+                        ns.push(char::from_digit(d, 10).unwrap());
+                        next.push(ns);
+                    }
+                }
+                out = next;
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn vault_unlock_challenge(
+    input: ChallengeUnlockInput,
+    state: State<AppState>,
+) -> Result<UnlockResult, String> {
+    {
+        let inner = state.inner.lock();
+        if let Some(until) = inner.locked_until {
+            if Instant::now() < until {
+                let remaining = until.saturating_duration_since(Instant::now()).as_secs();
+                return Err(format!("too many attempts; wait {}s", remaining.max(1)));
+            }
+        }
+    }
+    if !state.vault_file.exists() {
+        return Err("vault does not exist".into());
+    }
+    let candidates = candidates_from_challenge(&input.challenge, &input.response)?;
+    let bytes = read_all(&state.vault_file).map_err(|e| e.to_string())?;
+
+    for pin in candidates {
+        let pin_secret = SecretString::from(pin);
+        if let Ok((header, key, data)) = decrypt_from_bytes(&bytes, &pin_secret) {
+            let session = Session {
+                token: make_token(),
+                key,
+                header,
+                data,
+                expires_at: Instant::now() + Duration::from_secs(SESSION_TTL_SECS),
+            };
+            let result = unlock_result_from(&session);
+            let mut inner = state.inner.lock();
+            inner.session = Some(session);
+            inner.failed_attempts = 0;
+            inner.locked_until = None;
+            return Ok(result);
+        }
+    }
+
+    let mut inner = state.inner.lock();
+    inner.failed_attempts = inner.failed_attempts.saturating_add(1);
+    if inner.failed_attempts >= MAX_ATTEMPTS_BEFORE_BACKOFF {
+        let extra = inner.failed_attempts - MAX_ATTEMPTS_BEFORE_BACKOFF;
+        let backoff = Duration::from_secs(2u64.saturating_pow(extra.min(6)));
+        inner.locked_until = Some(Instant::now() + backoff);
+    }
+    Err("invalid pin".into())
+}
+
 #[tauri::command]
 pub fn session_touch(token: String, state: State<AppState>) -> Result<u64, String> {
     let mut inner = state.inner.lock();

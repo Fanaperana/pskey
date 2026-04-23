@@ -23,6 +23,7 @@ pub fn run() {
             commands::vault_exists,
             commands::vault_init,
             commands::vault_unlock,
+            commands::vault_unlock_challenge,
             commands::vault_lock,
             commands::session_touch,
             commands::list_entries,

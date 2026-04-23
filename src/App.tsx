@@ -91,6 +91,23 @@ type PendingAction =
 
 const SESSION_TTL_MS = 30_000;
 const PIN_LEN = 4;
+const CHALLENGE_ROTATE_MS = 30_000;
+
+/** Generate a 4-char challenge: 3 digits + 1 letter A-Z at a random slot. */
+function generateChallenge(): string {
+  const buf = new Uint32Array(5);
+  crypto.getRandomValues(buf);
+  const letterSlot = buf[0] % 4;
+  const chars: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    if (i === letterSlot) {
+      chars.push(String.fromCharCode(65 + (buf[i + 1] % 26))); // A-Z
+    } else {
+      chars.push(String.fromCharCode(48 + (buf[i + 1] % 10))); // 0-9
+    }
+  }
+  return chars.join("");
+}
 
 function App() {
   const [phase, setPhase] = useState<Phase>("loading");
@@ -118,6 +135,11 @@ function App() {
   );
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [setupPin, setSetupPin] = useState("");
+  const [challenge, setChallenge] = useState(() => generateChallenge());
+  const [challengeExpiresAt, setChallengeExpiresAt] = useState(
+    () => Date.now() + CHALLENGE_ROTATE_MS
+  );
+  const [challengeTick, setChallengeTick] = useState(0);
 
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [actionPin, setActionPin] = useState("");
@@ -180,7 +202,9 @@ function App() {
 
   useEffect(() => {
     if (phase !== "locked" || unlockPin.length !== PIN_LEN) return;
-    invoke<UnlockResult>("vault_unlock", { pin: unlockPin })
+    invoke<UnlockResult>("vault_unlock_challenge", {
+      input: { challenge, response: unlockPin.toUpperCase() },
+    })
       .then((r) => {
         setUnlockStatus("valid");
         window.setTimeout(() => {
@@ -202,6 +226,29 @@ function App() {
         }, 600);
       });
   }, [phase, unlockPin]);
+
+  // Rotate the challenge every 30s (only while locked).
+  useEffect(() => {
+    if (phase !== "locked") return;
+    const tickIv = window.setInterval(() => setChallengeTick((t) => t + 1), 1000);
+    return () => window.clearInterval(tickIv);
+  }, [phase]);
+  useEffect(() => {
+    if (phase !== "locked") return;
+    if (Date.now() >= challengeExpiresAt) {
+      setChallenge(generateChallenge());
+      setChallengeExpiresAt(Date.now() + CHALLENGE_ROTATE_MS);
+      setUnlockPin("");
+      setUnlockStatus(null);
+    }
+  }, [phase, challengeTick, challengeExpiresAt]);
+  // Fresh challenge whenever we enter the locked phase.
+  useEffect(() => {
+    if (phase === "locked") {
+      setChallenge(generateChallenge());
+      setChallengeExpiresAt(Date.now() + CHALLENGE_ROTATE_MS);
+    }
+  }, [phase]);
 
   const filtered = entries.filter((e) =>
     e.title.toLowerCase().includes(search.toLowerCase())
@@ -462,16 +509,32 @@ function App() {
   );
 
   const lockedView = (
-    <div className="px-2.5 py-3 flex flex-col items-center gap-2">
+    <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
       <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
         Unlock
+      </span>
+      {/* Challenge row (plaintext) */}
+      <div className="flex items-center gap-1">
+        <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
+          {challenge.split("").map((c, i) => (
+            <span
+              key={i}
+              className="flex size-5 items-center justify-center rounded-sm bg-muted/40 border border-border/40"
+            >
+              {c}
+            </span>
+          ))}
+        </div>
+      </div>
+      <span className="text-[8px] text-muted-foreground">
+        rotates in {Math.max(0, Math.ceil((challengeExpiresAt - Date.now()) / 1000))}s
       </span>
       <InputOTP
         maxLength={PIN_LEN}
         value={unlockPin}
-        onChange={setUnlockPin}
-        inputMode="numeric"
-        pattern="[0-9]*"
+        onChange={(v) => setUnlockPin(v.toUpperCase())}
+        inputMode="text"
+        pattern="[0-9A-Za-z]*"
         containerClassName="gap-1"
         autoFocus
       >
