@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Fanaperana/pskey/security/advisories/new
+    about: Please report vulnerabilities privately via GitHub Security Advisories.
+  - name: Question / discussion
+    url: https://github.com/Fanaperana/pskey/discussions
+    about: Ask usage or design questions in Discussions.
