@@ -1,90 +1,171 @@
-# PSKey
+<div align="center">
 
-Tiny transparent Tauri + React widget for storing passwords, backed by libsodium.
+# 🔐 PSKey
 
-## Security model
+**A tiny, transparent, always-on-top password manager widget.**
+Built with [Tauri](https://tauri.app) + [React](https://react.dev) + [libsodium](https://doc.libsodium.org).
 
-- **Vault file**: `$APP_DATA/vault.bin`.
-- **KDF**: Argon2id (libsodium `crypto_pwhash`, MODERATE ops/mem).
-- **Cipher**: XSalsa20-Poly1305 (libsodium `secretbox`).
-- **Plaintext**: msgpack-encoded `VaultData`.
-- **Per-entry PIN**: separate Argon2id salt + 32-byte hash stored inside the
-  encrypted blob. Verified with a constant-time compare.
-- **Session**: 30s sliding TTL, opaque token held in Rust state.
-- **Clipboard**: copy is performed in Rust and auto-cleared after 15s if the
-  clipboard still contains our value.
-- **Rate limit**: exponential backoff (base 2) after 3 failed unlocks.
-- **Autolock**: on window blur and on session expiry.
+<br />
 
-## Challenge-response unlock
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Rust](https://img.shields.io/badge/Rust-stable-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![libsodium](https://img.shields.io/badge/crypto-libsodium-3B2D8F?style=flat-square)](https://doc.libsodium.org)
+[![Argon2id](https://img.shields.io/badge/KDF-Argon2id-5A1F7A?style=flat-square)](https://en.wikipedia.org/wiki/Argon2)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)](#)
+[![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](#)
+
+<sub>145 px wide · transparent · draggable · autolocks on blur · challenge-response unlock</sub>
+
+</div>
+
+---
+
+## ✨ Highlights
+
+- 🪟 **Tiny widget** — 145 px transparent floating window; drag it anywhere.
+- 🔒 **Libsodium all the way down** — Argon2id + XSalsa20-Poly1305, nothing handrolled.
+- 🎭 **Challenge-response PIN** — the PIN you memorize is *never* what you type.
+- ⚡ **Async KDF** — heavy crypto runs off the UI thread, with a cheeky "Cooking…" indicator.
+- 🧊 **Autolock everywhere** — 30 s sliding session + instant lock on window blur.
+- 📋 **Self-wiping clipboard** — copied secrets are cleared after 15 s.
+- 🧱 **Hardened capabilities** — strict CSP, minimal Tauri permissions.
+
+## 🔐 Security model
+
+| Layer               | What                                                                |
+| ------------------- | ------------------------------------------------------------------- |
+| Vault file          | `$APP_DATA/vault.bin`, atomic write with `.bak` rotation            |
+| KDF                 | Argon2id via libsodium `crypto_pwhash` (MODERATE ops / mem)         |
+| Cipher              | XSalsa20-Poly1305 (libsodium `secretbox`)                           |
+| Plaintext           | msgpack-encoded `VaultData`, zeroized on drop                       |
+| Per-entry PIN       | separate Argon2id salt + 32-byte hash, constant-time compare        |
+| Session             | 30 s sliding TTL, opaque 24-byte token held in Rust state only      |
+| Clipboard           | copy performed in Rust, auto-cleared after 15 s if unchanged        |
+| Rate limit          | exponential backoff after 3 failed unlocks                          |
+| Autolock            | on window blur and on session expiry                                |
+| Front-end surface   | strict CSP, no remote assets, minimal Tauri capabilities            |
+
+## 🧩 Challenge-response unlock
 
 To protect the PIN against keyloggers and shoulder-surfing, PSKey uses a
-rotating 4-character challenge shown above the OTP input on the unlock screen.
-The user never types their raw PIN — they type a **response** computed per slot
-from their memorised PIN and the current challenge.
+rotating 4-character **challenge** shown above the OTP input. You never type
+your raw PIN — you type a **response** computed per slot from your memorized
+PIN and the current challenge.
+
+```text
+  ┌───┐ ┌───┐ ┌───┐ ┌───┐
+  │ 2 │ │ 9 │ │ I │ │ X │   ← challenge (rotates every 30s)
+  └───┘ └───┘ └───┘ └───┘
+      PIN in your head: 4 1 8 7
+  ┌───┐ ┌───┐ ┌───┐ ┌───┐
+  │ 6 │ │ A │ │ I │ │ X │   ← what you actually type
+  └───┘ └───┘ └───┘ └───┘
+```
 
 - **Alphabet**: digits `0-9` and uppercase letters `A-Z`.
 - **Challenge rotation**: every 30 seconds.
-- **Layout**: 4 slots; the app currently generates 3 digits + 1 letter at a
-  random position (to bound backend brute-force over the masked slot).
+- **Layout**: 4 slots; 3 digits + 1 letter at a random position (keeps backend
+  brute-force over the masked slot bounded to ≤ 10 Argon2 tries).
 
 ### Per-slot rule
 
-For each slot *i* (1..4), given `challenge[i]` and the user's memorised
+For each slot *i* (1..4), given `challenge[i]` and the user's memorized
 `pin_digit[i]` (0-9):
 
-| `challenge[i]` | Response to type | Notes                                     |
-| -------------- | ---------------- | ----------------------------------------- |
-| digit `0-9`    | `base19(pin_digit[i] + challenge[i])` | sum is in `0..=18`          |
-| letter `A-Z`   | `challenge[i]` itself                 | PIN digit at this slot is masked |
+| `challenge[i]` | Response to type                      | Notes                             |
+| -------------- | ------------------------------------- | --------------------------------- |
+| digit `0-9`    | `base19(pin_digit[i] + challenge[i])` | sum is in `0..=18`                |
+| letter `A-Z`   | `challenge[i]` itself                 | PIN digit at this slot is masked  |
 
 **Base-19 alphabet**: `0-9` → values 0-9, `A-I` → values 10-18.
 
 ### Examples
 
-All four slots, combining the rules:
+| challenge | pin | response | explanation                                        |
+| --------- | --- | -------- | -------------------------------------------------- |
+| `9`       | `9` | `I`      | `9 + 9 = 18 → I`                                   |
+| `1`       | `9` | `A`      | `1 + 9 = 10 → A`                                   |
+| `2`       | `4` | `6`      | `2 + 4 = 6`                                        |
+| `I`       | `1` | `I`      | letter challenge → type the letter                 |
+| `X`       | `9` | `X`      | letter challenge → PIN digit ignored for this slot |
 
-| challenge | pin  | response | explanation                                          |
-| --------- | ---- | -------- | ---------------------------------------------------- |
-| `9`       | `9`  | `I`      | `9+9 = 18 → I`                                       |
-| `1`       | `9`  | `A`      | `1+9 = 10 → A`                                       |
-| `2`       | `4`  | `6`      | `2+4 = 6`                                            |
-| `I`       | `1`  | `I`      | letter challenge → type the letter                   |
-| `X`       | `9`  | `X`      | letter challenge → PIN digit ignored for this slot   |
+Walk-through — challenge `"29IX"`, PIN `"4187"`:
 
-Walk-through: challenge `"29IX"`, PIN `"4187"`:
+- slot 1: `'2' + 4 = 6`  → `6`
+- slot 2: `'9' + 1 = 10` → `A`
+- slot 3: letter `'I'`   → `I`
+- slot 4: letter `'X'`   → `X`
 
-- slot 1: `'2' + 4 = 6`   → `6`
-- slot 2: `'9' + 1 = 10`  → `A`
-- slot 3: letter `'I'`    → `I`
-- slot 4: letter `'X'`    → `X`
+You type **`6AIX`** into the OTP. ✅
 
-User types **`6AIX`** into the OTP.
+### Verification (backend)
 
-### Verification
-
-The frontend sends `(challenge, response)` to the backend
-(`vault_unlock_challenge`). The backend:
+The frontend sends `(challenge, response)` to `vault_unlock_challenge`. The
+Rust backend:
 
 1. Rejects any challenge containing more than 1 letter.
-2. For each digit-challenge slot, recovers `pin_digit = (base19(response) − challenge) mod 19`,
-   rejects anything outside `0..=9`.
+2. For each digit-challenge slot, recovers
+   `pin_digit = (base19(response) − challenge) mod 19` and rejects anything
+   outside `0..=9`.
 3. For each letter-challenge slot, requires `response[i] == challenge[i]`
    (case-insensitive) and enumerates the 10 possible PIN digits.
 4. Tries each candidate PIN (≤ 10 with the 1-letter cap) against the Argon2id
    vault key. On success, opens the session. Otherwise a **single** attempt is
-   counted against the rate limiter regardless of how many candidates were
+   counted against the rate limiter, regardless of how many candidates were
    tried.
 
-## Dev
+## 🚀 Getting started
 
 ```sh
 pnpm install
 pnpm tauri dev
 ```
 
----
+Requirements:
 
-## Recommended IDE Setup
+- Node 20+ and pnpm
+- Rust stable toolchain
+- Tauri v2 prerequisites — <https://v2.tauri.app/start/prerequisites/>
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+### Build
+
+```sh
+pnpm tauri build
+```
+
+## 🧪 Checks
+
+```sh
+npx tsc --noEmit              # TypeScript
+cd src-tauri && cargo check   # Rust
+```
+
+## 🗺️ Roadmap
+
+- [ ] Linux / Windows packaging + icons
+- [ ] Optional auto-update channel
+- [ ] Import / export (encrypted)
+- [ ] Tests for the vault format + challenge decoder
+- [ ] Accessibility pass on the tiny widget UI
+
+Open to ideas — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## 🤝 Contributing
+
+PRs welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md) before opening a PR. Security issues?
+Report them privately via [SECURITY.md](SECURITY.md).
+
+## 🧰 Recommended IDE Setup
+
+- [VS Code](https://code.visualstudio.com/)
+  + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode)
+  + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+
+## 📜 License
+
+[MIT](LICENSE) © 2026 Fanaperana
