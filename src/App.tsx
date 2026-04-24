@@ -180,10 +180,7 @@ function App() {
   const [challengeExpiresAt, setChallengeExpiresAt] = useState(
     () => Date.now() + CHALLENGE_ROTATE_MS
   );
-  const [challengeTick, setChallengeTick] = useState(0);
-  void challengeTick;
-  const challengeBoxRef = useRef<HTMLDivElement | null>(null);
-  const [challengeBox, setChallengeBox] = useState({ w: 0, h: 0 });
+  const [challengeNow, setChallengeNow] = useState(() => Date.now());
   const [busyPhrase, setBusyPhrase] = useState<string | null>(null);
   const [busyDots, setBusyDots] = useState(0);
 
@@ -288,30 +285,11 @@ function App() {
     if (phase !== "locked") return;
     let rafId = 0;
     const loop = () => {
-      setChallengeTick((t) => (t + 1) % 1_000_000);
+      setChallengeNow(Date.now());
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafId);
-  }, [phase]);
-
-  // Measure the challenge box so the animated border uses real pixel perimeter.
-  useEffect(() => {
-    if (phase !== "locked") return;
-    const el = challengeBoxRef.current;
-    if (!el) return;
-    const measure = () => {
-      const r = el.getBoundingClientRect();
-      setChallengeBox((prev) =>
-        prev.w === Math.round(r.width) && prev.h === Math.round(r.height)
-          ? prev
-          : { w: Math.round(r.width), h: Math.round(r.height) }
-      );
-    };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
   }, [phase]);
   // Schedule rotation precisely at expiry so there's no visible gap after drain.
   useEffect(() => {
@@ -483,9 +461,24 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actionPin]);
 
+  const challengeMsLeft = Math.max(0, challengeExpiresAt - challengeNow);
+  const challengeRatio =
+    phase === "locked"
+      ? Math.max(0, Math.min(1, challengeMsLeft / CHALLENGE_ROTATE_MS))
+      : 0;
+  const challengeHue = Math.round(140 * challengeRatio);
+  const challengeStrokeColor = `hsl(${challengeHue} 60% 60% / 0.9)`;
+  const challengeTrackColor = `hsl(${challengeHue} 35% 55% / 0.18)`;
+  const challengeUrgent = phase === "locked" && challengeMsLeft <= 10_000;
+  const challengePulseDuration = Math.round(
+    320 +
+      (Math.max(0, Math.min(10_000, challengeMsLeft)) / 10_000) * 580
+  );
+  const challengeHalfWidth = `${challengeRatio * 50}%`;
+
   const titleBar = (
     <div
-      className="flex items-center justify-between px-2.5 py-1 border-b border-border/30"
+      className="relative flex items-center justify-between px-2.5 py-1 border-b border-border/30"
       data-tauri-drag-region
     >
       {phase === "unlocked" && view !== "list" ? (
@@ -556,6 +549,30 @@ function App() {
           <ShieldX className="size-4" />
         </Button>
       </div>
+      {phase === "locked" && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px">
+          <div
+            className="absolute inset-x-0 top-0 h-px"
+            style={{ backgroundColor: challengeTrackColor }}
+          />
+          <div
+            className={cn("absolute left-0 top-0 h-px", challengeUrgent && "challenge-pulse")}
+            style={{
+              width: challengeHalfWidth,
+              backgroundColor: challengeStrokeColor,
+              animationDuration: `${challengePulseDuration}ms`,
+            }}
+          />
+          <div
+            className={cn("absolute right-0 top-0 h-px", challengeUrgent && "challenge-pulse")}
+            style={{
+              width: challengeHalfWidth,
+              backgroundColor: challengeStrokeColor,
+              animationDuration: `${challengePulseDuration}ms`,
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 
@@ -619,24 +636,12 @@ function App() {
   );
 
   const lockedView = (() => {
-    const msLeft = Math.max(0, challengeExpiresAt - Date.now());
-    const secLeft = msLeft / 1000;
-    // Hue: 140 (green) -> 0 (red) as ratio 1 -> 0
-    const ratio = Math.max(0, Math.min(1, msLeft / CHALLENGE_ROTATE_MS));
-    const hue = Math.round(140 * ratio);
-    // Muted palette: lower saturation + lightness tuned for both dark/light bg.
-    const strokeColor = `hsl(${hue} 60% 60% / 0.85)`;
-    const trackColor = `hsl(${hue} 40% 55% / 0.18)`;
-    const urgent = secLeft <= 10;
-    // Pulse faster as time runs out: 900ms at 10s -> 320ms at 0s
-    const pulseDuration = Math.round(320 + (Math.max(0, Math.min(10, secLeft)) / 10) * 580);
     return (
     <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
       <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
         Unlock
       </span>
-      {/* Challenge row (plaintext) with progressive border draining over rotate window */}
-      <div className="relative inline-flex" ref={challengeBoxRef}>
+      <div className="inline-flex">
         <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
           {challenge.split("").map((c, i) => (
             <span
@@ -647,47 +652,6 @@ function App() {
             </span>
           ))}
         </div>
-        {challengeBox.w > 0 && challengeBox.h > 0 && (
-        <svg
-          className={cn(
-            "pointer-events-none absolute -inset-[3px] h-[calc(100%+6px)] w-[calc(100%+6px)] overflow-visible",
-            urgent && "challenge-pulse"
-          )}
-          viewBox={`0 0 ${challengeBox.w + 6} ${challengeBox.h + 6}`}
-          aria-hidden
-          style={urgent ? { animationDuration: `${pulseDuration}ms`, color: strokeColor } : { color: strokeColor }}
-        >
-          {/* Subtle baseline track so the border blends with the card even when drained. */}
-          <rect
-            x="0.5"
-            y="0.5"
-            width={challengeBox.w + 5}
-            height={challengeBox.h + 5}
-            rx="4"
-            ry="4"
-            fill="none"
-            stroke={trackColor}
-            strokeWidth="1"
-            style={{ transition: "stroke 400ms linear" }}
-          />
-          <rect
-            x="0.5"
-            y="0.5"
-            width={challengeBox.w + 5}
-            height={challengeBox.h + 5}
-            rx="4"
-            ry="4"
-            fill="none"
-            stroke={strokeColor}
-            strokeWidth="1"
-            strokeLinecap="butt"
-            pathLength={1}
-            strokeDasharray={`${ratio} 1`}
-            strokeDashoffset={0}
-            style={{ transition: "stroke 400ms linear" }}
-          />
-        </svg>
-        )}
       </div>
       <InputOTP
         maxLength={PIN_LEN}

@@ -139,17 +139,6 @@
     }
 }
 
-@keyframes challenge-progress-drain {
-  from { stroke-dashoffset: 0; }
-  to { stroke-dashoffset: 1; }
-}
-
-.challenge-progress {
-  animation-name: challenge-progress-drain;
-  animation-timing-function: linear;
-  animation-fill-mode: forwards;
-}
-
 @keyframes challenge-pulse {
   0%, 100% { opacity: 0.9; filter: drop-shadow(0 0 0 transparent); }
   50% { opacity: 0.55; filter: drop-shadow(0 0 2px currentColor); }
