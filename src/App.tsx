@@ -1050,6 +1050,22 @@ function App() {
     };
   }, [phase, doLock]);
 
+  // Tray-triggered lock ("vault://locked" event from Rust).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("vault://locked", () => {
+          if (phase === "unlocked") doLock();
+        })
+      )
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
+  }, [phase, doLock]);
+
   return (
     <div
       ref={rootRef}

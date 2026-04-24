@@ -3,7 +3,11 @@
 pub mod commands;
 pub mod vault;
 
-use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -17,6 +21,68 @@ pub fn run() {
                 .expect("failed to resolve app data dir");
             let vault_file = vault::vault_path(&data_dir);
             app.manage(commands::AppState::new(vault_file));
+
+            // ── System tray ────────────────────────────────────────────────
+            let show_hide = MenuItem::with_id(app, "show_hide", "Show / Hide", true, None::<&str>)?;
+            let lock = MenuItem::with_id(app, "lock", "Lock vault", true, None::<&str>)?;
+            let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit PSKey", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_hide, &lock, &separator, &quit])?;
+
+            let _tray = TrayIconBuilder::with_id("pskey-tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .icon_as_template(true)
+                .tooltip("PSKey")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show_hide" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            match w.is_visible() {
+                                Ok(true) => {
+                                    let _ = w.hide();
+                                }
+                                _ => {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        }
+                    }
+                    "lock" => {
+                        if let Some(state) = app.try_state::<commands::AppState>() {
+                            commands::lock_session(&state);
+                        }
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.emit("vault://locked", ());
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            match w.is_visible() {
+                                Ok(true) => {
+                                    let _ = w.hide();
+                                }
+                                _ => {
+                                    let _ = w.show();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

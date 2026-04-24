@@ -213,6 +213,12 @@ pub fn vault_lock(state: State<AppState>) {
     inner.session = None;
 }
 
+/// Lock the vault from Rust (e.g. tray menu). Same effect as the command.
+pub fn lock_session(state: &AppState) {
+    let mut inner = state.inner.lock();
+    inner.session = None;
+}
+
 // ─── Challenge-response unlock ───
 //
 // Frontend shows a 4-char "challenge" above the OTP. User types a 4-char
