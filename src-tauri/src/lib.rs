@@ -73,8 +73,12 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit PSKey", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_hide, &lock, &separator, &quit])?;
 
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
+                "../icons/tray.png"
+            ))?;
+
             let _tray = TrayIconBuilder::with_id("pskey-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
                 .icon_as_template(true)
                 .tooltip("PSKey")
                 .menu(&menu)
