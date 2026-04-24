@@ -596,8 +596,8 @@ function App() {
       <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
         Unlock
       </span>
-      {/* Challenge row (plaintext) */}
-      <div className="flex items-center gap-1">
+      {/* Challenge row (plaintext) with progressive border draining over rotate window */}
+      <div className="relative inline-flex p-0.5">
         <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
           {challenge.split("").map((c, i) => (
             <span
@@ -608,10 +608,31 @@ function App() {
             </span>
           ))}
         </div>
+        <svg
+          key={challengeExpiresAt}
+          className="pointer-events-none absolute inset-0 h-full w-full overflow-visible text-primary"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          aria-hidden
+        >
+          <rect
+            x="0.75"
+            y="0.75"
+            width="98.5"
+            height="98.5"
+            rx="4"
+            ry="4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+            pathLength={1}
+            strokeDasharray="1 1"
+            className="challenge-progress"
+            style={{ animationDuration: `${CHALLENGE_ROTATE_MS}ms` }}
+          />
+        </svg>
       </div>
-      <span className="text-[8px] text-muted-foreground">
-        rotates in {Math.max(0, Math.ceil((challengeExpiresAt - Date.now()) / 1000))}s
-      </span>
       <InputOTP
         maxLength={PIN_LEN}
         value={unlockPin}

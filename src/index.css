@@ -138,3 +138,14 @@
     @apply font-sans;
     }
 }
+
+@keyframes challenge-progress-drain {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: 1; }
+}
+
+.challenge-progress {
+  animation-name: challenge-progress-drain;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
