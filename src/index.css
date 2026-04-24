@@ -151,8 +151,8 @@
 }
 
 @keyframes challenge-pulse {
-  0%, 100% { opacity: 1; filter: drop-shadow(0 0 0 transparent); }
-  50% { opacity: 0.55; filter: drop-shadow(0 0 3px currentColor); }
+  0%, 100% { opacity: 0.9; filter: drop-shadow(0 0 0 transparent); }
+  50% { opacity: 0.55; filter: drop-shadow(0 0 2px currentColor); }
 }
 
 .challenge-pulse {

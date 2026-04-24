@@ -12,6 +12,8 @@ import {
   Trash2,
   ChevronLeft,
   ChevronRight,
+  ShieldX,
+  TextCursorInput,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -476,12 +478,7 @@ function App() {
           <ArrowLeft className="size-3" />
         </Button>
       ) : (
-        <span
-          className="text-[10px] font-semibold text-muted-foreground tracking-widest uppercase"
-          data-tauri-drag-region
-        >
-          PSKey
-        </span>
+        <TextCursorInput className="size-4" />
       )}
       {phase === "unlocked" && view !== "list" && (
         <span
@@ -510,17 +507,17 @@ function App() {
                 });
               }}
             >
-              <Search className="size-3" />
+              <Search className="size-4" />
             </Button>
             <Button
               variant="ghost"
               size="icon-xs"
               onClick={() => setView("settings")}
             >
-              <Settings className="size-3" />
+              <Settings className="size-4" />
             </Button>
             <Button variant="ghost" size="icon-xs" onClick={doLock} title="Lock">
-              <Lock className="size-3" />
+              <Lock className="size-4" />
             </Button>
           </>
         )}
@@ -529,7 +526,7 @@ function App() {
           size="icon-xs"
           onClick={() => getCurrentWindow().hide()}
         >
-          <span className="text-xs leading-none">&times;</span>
+          <ShieldX className="size-4" />
         </Button>
       </div>
     </div>
@@ -600,10 +597,12 @@ function App() {
     // Hue: 140 (green) -> 0 (red) as ratio 1 -> 0
     const ratio = Math.max(0, Math.min(1, msLeft / CHALLENGE_ROTATE_MS));
     const hue = Math.round(140 * ratio);
-    const strokeColor = `hsl(${hue} 85% 55%)`;
+    // Muted palette: lower saturation + lightness tuned for both dark/light bg.
+    const strokeColor = `hsl(${hue} 60% 60% / 0.85)`;
+    const trackColor = `hsl(${hue} 40% 55% / 0.18)`;
     const urgent = secLeft <= 10;
-    // Pulse faster as time runs out: 900ms at 10s -> 300ms at 0s
-    const pulseDuration = Math.round(300 + (Math.max(0, Math.min(10, secLeft)) / 10) * 600);
+    // Pulse faster as time runs out: 900ms at 10s -> 320ms at 0s
+    const pulseDuration = Math.round(320 + (Math.max(0, Math.min(10, secLeft)) / 10) * 580);
     return (
     <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
       <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
@@ -632,6 +631,20 @@ function App() {
           aria-hidden
           style={urgent ? { animationDuration: `${pulseDuration}ms`, color: strokeColor } : { color: strokeColor }}
         >
+          {/* Subtle baseline track so the border blends with the card even when drained. */}
+          <rect
+            x="0"
+            y="0"
+            width="100"
+            height="100"
+            rx="4"
+            ry="4"
+            fill="none"
+            stroke={trackColor}
+            strokeWidth="1"
+            vectorEffect="non-scaling-stroke"
+            style={{ transition: "stroke 400ms linear" }}
+          />
           <rect
             x="0"
             y="0"
@@ -641,7 +654,8 @@ function App() {
             ry="4"
             fill="none"
             stroke={strokeColor}
-            strokeWidth="1.5"
+            strokeWidth="1"
+            strokeLinecap="round"
             vectorEffect="non-scaling-stroke"
             pathLength={1}
             strokeDasharray="1 1"
