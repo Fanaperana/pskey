@@ -281,18 +281,21 @@ function App() {
   // Rotate the challenge every 30s (only while locked).
   useEffect(() => {
     if (phase !== "locked") return;
-    const tickIv = window.setInterval(() => setChallengeTick((t) => t + 1), 1000);
+    const tickIv = window.setInterval(() => setChallengeTick((t) => t + 1), 250);
     return () => window.clearInterval(tickIv);
   }, [phase]);
+  // Schedule rotation precisely at expiry so there's no visible gap after drain.
   useEffect(() => {
     if (phase !== "locked") return;
-    if (Date.now() >= challengeExpiresAt) {
+    const delay = Math.max(0, challengeExpiresAt - Date.now());
+    const t = window.setTimeout(() => {
       setChallenge(generateChallenge());
       setChallengeExpiresAt(Date.now() + CHALLENGE_ROTATE_MS);
       setUnlockPin("");
       setUnlockStatus(null);
-    }
-  }, [phase, challengeTick, challengeExpiresAt]);
+    }, delay);
+    return () => window.clearTimeout(t);
+  }, [phase, challengeExpiresAt]);
   // Fresh challenge whenever we enter the locked phase.
   useEffect(() => {
     if (phase === "locked") {
