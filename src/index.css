@@ -149,3 +149,12 @@
   animation-timing-function: linear;
   animation-fill-mode: forwards;
 }
+
+@keyframes challenge-pulse {
+  0%, 100% { opacity: 1; filter: drop-shadow(0 0 0 transparent); }
+  50% { opacity: 0.55; filter: drop-shadow(0 0 3px currentColor); }
+}
+
+.challenge-pulse {
+  animation: challenge-pulse 800ms ease-in-out infinite;
+}

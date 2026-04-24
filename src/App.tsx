@@ -591,13 +591,23 @@ function App() {
     </div>
   );
 
-  const lockedView = (
+  const lockedView = (() => {
+    const msLeft = Math.max(0, challengeExpiresAt - Date.now());
+    const secLeft = msLeft / 1000;
+    // Hue: 140 (green) -> 0 (red) as ratio 1 -> 0
+    const ratio = Math.max(0, Math.min(1, msLeft / CHALLENGE_ROTATE_MS));
+    const hue = Math.round(140 * ratio);
+    const strokeColor = `hsl(${hue} 85% 55%)`;
+    const urgent = secLeft <= 10;
+    // Pulse faster as time runs out: 900ms at 10s -> 300ms at 0s
+    const pulseDuration = Math.round(300 + (Math.max(0, Math.min(10, secLeft)) / 10) * 600);
+    return (
     <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
       <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
         Unlock
       </span>
       {/* Challenge row (plaintext) with progressive border draining over rotate window */}
-      <div className="relative inline-flex p-0.5">
+      <div className="relative inline-flex">
         <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
           {challenge.split("").map((c, i) => (
             <span
@@ -610,26 +620,34 @@ function App() {
         </div>
         <svg
           key={challengeExpiresAt}
-          className="pointer-events-none absolute inset-0 h-full w-full overflow-visible text-primary"
+          className={cn(
+            "pointer-events-none absolute -inset-[3px] h-[calc(100%+6px)] w-[calc(100%+6px)] overflow-visible",
+            urgent && "challenge-pulse"
+          )}
           viewBox="0 0 100 100"
           preserveAspectRatio="none"
           aria-hidden
+          style={urgent ? { animationDuration: `${pulseDuration}ms`, color: strokeColor } : { color: strokeColor }}
         >
           <rect
-            x="0.75"
-            y="0.75"
-            width="98.5"
-            height="98.5"
+            x="0"
+            y="0"
+            width="100"
+            height="100"
             rx="4"
             ry="4"
             fill="none"
-            stroke="currentColor"
+            stroke={strokeColor}
             strokeWidth="1.5"
             vectorEffect="non-scaling-stroke"
             pathLength={1}
             strokeDasharray="1 1"
+            strokeDashoffset={0}
             className="challenge-progress"
-            style={{ animationDuration: `${CHALLENGE_ROTATE_MS}ms` }}
+            style={{
+              animationDuration: `${CHALLENGE_ROTATE_MS}ms`,
+              transition: "stroke 400ms linear",
+            }}
           />
         </svg>
       </div>
@@ -658,7 +676,8 @@ function App() {
         </span>
       )}
     </div>
-  );
+    );
+  })();
 
   const listView = (
     <>
