@@ -6,7 +6,7 @@ pub mod vault;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
+    Emitter, Manager, WindowEvent,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -14,6 +14,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Close button / ⌘W: hide instead of quitting. Tray "Quit" exits.
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -21,6 +28,43 @@ pub fn run() {
                 .expect("failed to resolve app data dir");
             let vault_file = vault::vault_path(&data_dir);
             app.manage(commands::AppState::new(vault_file));
+
+            // ── Global shortcut: ⌘⇧P (or Ctrl+Shift+P) toggles the window ──
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_global_shortcut::{
+                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+                };
+
+                let toggle = Shortcut::new(
+                    Some(Modifiers::SUPER | Modifiers::SHIFT),
+                    Code::KeyP,
+                );
+
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |app, shortcut, event| {
+                            if event.state() != ShortcutState::Pressed {
+                                return;
+                            }
+                            if shortcut == &toggle {
+                                if let Some(w) = app.get_webview_window("main") {
+                                    match w.is_visible() {
+                                        Ok(true) => {
+                                            let _ = w.hide();
+                                        }
+                                        _ => {
+                                            let _ = w.show();
+                                            let _ = w.set_focus();
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .build(),
+                )?;
+                app.global_shortcut().register(toggle)?;
+            }
 
             // ── System tray ────────────────────────────────────────────────
             let show_hide = MenuItem::with_id(app, "show_hide", "Show / Hide", true, None::<&str>)?;

@@ -524,7 +524,7 @@ function App() {
         <Button
           variant="ghost"
           size="icon-xs"
-          onClick={() => getCurrentWindow().close()}
+          onClick={() => getCurrentWindow().hide()}
         >
           <span className="text-xs leading-none">&times;</span>
         </Button>
