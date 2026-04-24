@@ -655,7 +655,7 @@ function App() {
             fill="none"
             stroke={strokeColor}
             strokeWidth="1"
-            strokeLinecap="round"
+            strokeLinecap="butt"
             vectorEffect="non-scaling-stroke"
             pathLength={1}
             strokeDasharray="1 1"
