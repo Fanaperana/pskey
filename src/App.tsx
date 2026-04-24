@@ -180,7 +180,6 @@ function App() {
   const [challengeExpiresAt, setChallengeExpiresAt] = useState(
     () => Date.now() + CHALLENGE_ROTATE_MS
   );
-  const [challengeNow, setChallengeNow] = useState(() => Date.now());
   const [busyPhrase, setBusyPhrase] = useState<string | null>(null);
   const [busyDots, setBusyDots] = useState(0);
 
@@ -280,17 +279,6 @@ function App() {
       });
   }, [phase, unlockPin]);
 
-  // Rotate the challenge every 30s (only while locked).
-  useEffect(() => {
-    if (phase !== "locked") return;
-    let rafId = 0;
-    const loop = () => {
-      setChallengeNow(Date.now());
-      rafId = requestAnimationFrame(loop);
-    };
-    rafId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafId);
-  }, [phase]);
   // Schedule rotation precisely at expiry so there's no visible gap after drain.
   useEffect(() => {
     if (phase !== "locked") return;
@@ -461,21 +449,6 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [actionPin]);
 
-  const challengeMsLeft = Math.max(0, challengeExpiresAt - challengeNow);
-  const challengeRatio =
-    phase === "locked"
-      ? Math.max(0, Math.min(1, challengeMsLeft / CHALLENGE_ROTATE_MS))
-      : 0;
-  const challengeHue = Math.round(140 * challengeRatio);
-  const challengeStrokeColor = `hsl(${challengeHue} 60% 60% / 0.9)`;
-  const challengeTrackColor = `hsl(${challengeHue} 35% 55% / 0.18)`;
-  const challengeUrgent = phase === "locked" && challengeMsLeft <= 10_000;
-  const challengePulseDuration = Math.round(
-    320 +
-      (Math.max(0, Math.min(10_000, challengeMsLeft)) / 10_000) * 580
-  );
-  const challengeHalfWidth = `${challengeRatio * 50}%`;
-
   const titleBar = (
     <div
       className="relative flex items-center justify-between px-2.5 py-1 border-b border-border/30"
@@ -553,23 +526,17 @@ function App() {
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px">
           <div
             className="absolute inset-x-0 top-0 h-px"
-            style={{ backgroundColor: challengeTrackColor }}
+            style={{ backgroundColor: "hsl(140 35% 55% / 0.18)" }}
           />
           <div
-            className={cn("absolute left-0 top-0 h-px", challengeUrgent && "challenge-pulse")}
-            style={{
-              width: challengeHalfWidth,
-              backgroundColor: challengeStrokeColor,
-              animationDuration: `${challengePulseDuration}ms`,
-            }}
+            key={`challenge-left-${challengeExpiresAt}`}
+            className="challenge-progress-left absolute left-0 top-0 h-px w-1/2"
+            style={{ animationDuration: `${CHALLENGE_ROTATE_MS}ms` }}
           />
           <div
-            className={cn("absolute right-0 top-0 h-px", challengeUrgent && "challenge-pulse")}
-            style={{
-              width: challengeHalfWidth,
-              backgroundColor: challengeStrokeColor,
-              animationDuration: `${challengePulseDuration}ms`,
-            }}
+            key={`challenge-right-${challengeExpiresAt}`}
+            className="challenge-progress-right absolute right-0 top-0 h-px w-1/2"
+            style={{ animationDuration: `${CHALLENGE_ROTATE_MS}ms` }}
           />
         </div>
       )}

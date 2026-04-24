@@ -139,6 +139,28 @@
     }
 }
 
+@keyframes challenge-progress-left {
+  from {
+    transform: scaleX(1);
+    background-color: hsl(140 60% 60% / 0.9);
+  }
+  to {
+    transform: scaleX(0);
+    background-color: hsl(0 60% 60% / 0.9);
+  }
+}
+
+@keyframes challenge-progress-right {
+  from {
+    transform: scaleX(1);
+    background-color: hsl(140 60% 60% / 0.9);
+  }
+  to {
+    transform: scaleX(0);
+    background-color: hsl(0 60% 60% / 0.9);
+  }
+}
+
 @keyframes challenge-pulse {
   0%, 100% { opacity: 0.9; filter: drop-shadow(0 0 0 transparent); }
   50% { opacity: 0.55; filter: drop-shadow(0 0 2px currentColor); }
@@ -146,4 +168,24 @@
 
 .challenge-pulse {
   animation: challenge-pulse 800ms ease-in-out infinite;
+}
+
+.challenge-progress-left {
+  transform-origin: left center;
+  animation-name: challenge-progress-left, challenge-pulse;
+  animation-duration: 30s, 800ms;
+  animation-delay: 0s, 20s;
+  animation-timing-function: linear, ease-in-out;
+  animation-fill-mode: forwards, none;
+  animation-iteration-count: 1, infinite;
+}
+
+.challenge-progress-right {
+  transform-origin: right center;
+  animation-name: challenge-progress-right, challenge-pulse;
+  animation-duration: 30s, 800ms;
+  animation-delay: 0s, 20s;
+  animation-timing-function: linear, ease-in-out;
+  animation-fill-mode: forwards, none;
+  animation-iteration-count: 1, infinite;
 }
