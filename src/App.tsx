@@ -181,6 +181,9 @@ function App() {
     () => Date.now() + CHALLENGE_ROTATE_MS
   );
   const [challengeTick, setChallengeTick] = useState(0);
+  void challengeTick;
+  const challengeBoxRef = useRef<HTMLDivElement | null>(null);
+  const [challengeBox, setChallengeBox] = useState({ w: 0, h: 0 });
   const [busyPhrase, setBusyPhrase] = useState<string | null>(null);
   const [busyDots, setBusyDots] = useState(0);
 
@@ -283,8 +286,32 @@ function App() {
   // Rotate the challenge every 30s (only while locked).
   useEffect(() => {
     if (phase !== "locked") return;
-    const tickIv = window.setInterval(() => setChallengeTick((t) => t + 1), 250);
-    return () => window.clearInterval(tickIv);
+    let rafId = 0;
+    const loop = () => {
+      setChallengeTick((t) => (t + 1) % 1_000_000);
+      rafId = requestAnimationFrame(loop);
+    };
+    rafId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafId);
+  }, [phase]);
+
+  // Measure the challenge box so the animated border uses real pixel perimeter.
+  useEffect(() => {
+    if (phase !== "locked") return;
+    const el = challengeBoxRef.current;
+    if (!el) return;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      setChallengeBox((prev) =>
+        prev.w === Math.round(r.width) && prev.h === Math.round(r.height)
+          ? prev
+          : { w: Math.round(r.width), h: Math.round(r.height) }
+      );
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [phase]);
   // Schedule rotation precisely at expiry so there's no visible gap after drain.
   useEffect(() => {
@@ -609,7 +636,7 @@ function App() {
         Unlock
       </span>
       {/* Challenge row (plaintext) with progressive border draining over rotate window */}
-      <div className="relative inline-flex">
+      <div className="relative inline-flex" ref={challengeBoxRef}>
         <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
           {challenge.split("").map((c, i) => (
             <span
@@ -620,53 +647,47 @@ function App() {
             </span>
           ))}
         </div>
+        {challengeBox.w > 0 && challengeBox.h > 0 && (
         <svg
-          key={challengeExpiresAt}
           className={cn(
             "pointer-events-none absolute -inset-[3px] h-[calc(100%+6px)] w-[calc(100%+6px)] overflow-visible",
             urgent && "challenge-pulse"
           )}
-          viewBox="0 0 100 100"
-          preserveAspectRatio="none"
+          viewBox={`0 0 ${challengeBox.w + 6} ${challengeBox.h + 6}`}
           aria-hidden
           style={urgent ? { animationDuration: `${pulseDuration}ms`, color: strokeColor } : { color: strokeColor }}
         >
           {/* Subtle baseline track so the border blends with the card even when drained. */}
           <rect
-            x="0"
-            y="0"
-            width="100"
-            height="100"
+            x="0.5"
+            y="0.5"
+            width={challengeBox.w + 5}
+            height={challengeBox.h + 5}
             rx="4"
             ry="4"
             fill="none"
             stroke={trackColor}
             strokeWidth="1"
-            vectorEffect="non-scaling-stroke"
             style={{ transition: "stroke 400ms linear" }}
           />
           <rect
-            x="0"
-            y="0"
-            width="100"
-            height="100"
+            x="0.5"
+            y="0.5"
+            width={challengeBox.w + 5}
+            height={challengeBox.h + 5}
             rx="4"
             ry="4"
             fill="none"
             stroke={strokeColor}
             strokeWidth="1"
             strokeLinecap="butt"
-            vectorEffect="non-scaling-stroke"
             pathLength={1}
-            strokeDasharray="1 1"
+            strokeDasharray={`${ratio} 1`}
             strokeDashoffset={0}
-            className="challenge-progress"
-            style={{
-              animationDuration: `${CHALLENGE_ROTATE_MS}ms`,
-              transition: "stroke 400ms linear",
-            }}
+            style={{ transition: "stroke 400ms linear" }}
           />
         </svg>
+        )}
       </div>
       <InputOTP
         maxLength={PIN_LEN}
