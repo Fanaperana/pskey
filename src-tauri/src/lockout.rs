@@ -11,10 +11,10 @@
 //! Cooldown after each lockout escalates: 1m → 3m → 5m → 10m → 15m → 30m →
 //! 1h → 3h → 12h → 24h (cap).
 
+use crate::io_util::{self, now_unix};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io::Write};
+use std::fs;
+use std::path::Path;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LockoutState {
@@ -89,17 +89,6 @@ impl LockoutState {
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-pub fn lockout_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("lockout.json")
-}
-
 pub fn load(path: &Path) -> LockoutState {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -108,19 +97,9 @@ pub fn load(path: &Path) -> LockoutState {
 }
 
 pub fn save(path: &Path, s: &LockoutState) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(s)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    io_util::atomic_write(path, &bytes, false)
 }
 
 /// Human-readable cooldown for error messages: "45s", "3m", "1h 30m".

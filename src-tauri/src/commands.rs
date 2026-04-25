@@ -1,10 +1,13 @@
 //! Tauri state & commands — keeps secrets in Rust, exposes only metadata to JS.
 
+use crate::device_secret::DeviceSecret;
+use crate::error::{CmdResult, CommandError};
+use crate::io_util::now_unix;
 use crate::lockout::{self, LockoutState};
 use crate::settings::{self, Settings};
 use crate::vault::{
-    atomic_write, decrypt_from_bytes, encrypt_to_bytes, hash_entry_pin_with, read_all,
-    verify_entry_pin, Entry, EntryMeta, KdfStrength, PinHash, VaultData, VaultHeader,
+    self, decrypt_from_bytes, encrypt_to_bytes, open_entry_secret, read_all, seal_entry_secret,
+    verify_entry_pin, Entry, EntryMeta, KdfStrength, VaultData, VaultFormat, VaultHeader,
 };
 use dryoc::classic::crypto_secretbox::Key as SbKey;
 use dryoc::rng::copy_randombytes;
@@ -12,7 +15,7 @@ use parking_lot::Mutex;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use uuid::Uuid;
@@ -20,6 +23,11 @@ use zeroize::Zeroize;
 
 const SESSION_TTL_SECS: u64 = 30;
 const CLIPBOARD_CLEAR_SECS: u64 = 15;
+/// Minimum PIN length for new vaults / new entries. The 4-digit floor is
+/// only safe because every Argon2id derivation also mixes in a 32-byte
+/// device secret stored outside the vault file (`device_secret.bin`).
+/// Without that file, brute-forcing the 10⁴ keyspace is infeasible.
+pub const MIN_PIN_LEN: usize = 4;
 
 struct Session {
     token: String,
@@ -45,6 +53,10 @@ pub struct AppState {
     vault_file: PathBuf,
     settings_file: PathBuf,
     lockout_file: PathBuf,
+    /// Per-install 32-byte secret mixed into every Argon2id derivation.
+    /// Lives outside the vault file (`device_secret.bin`) so vault-only
+    /// theft yields no offline brute-force surface.
+    device_secret: DeviceSecret,
 }
 
 impl AppState {
@@ -52,6 +64,7 @@ impl AppState {
         vault_file: PathBuf,
         settings_file: PathBuf,
         lockout_file: PathBuf,
+        device_secret: DeviceSecret,
         lockout: LockoutState,
     ) -> Self {
         Self {
@@ -62,6 +75,7 @@ impl AppState {
             vault_file,
             settings_file,
             lockout_file,
+            device_secret,
         }
     }
 }
@@ -95,17 +109,9 @@ pub struct AddEntryInput {
     custom_pin: Option<String>,
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn make_token() -> String {
     let mut buf = [0u8; 24];
     copy_randombytes(&mut buf);
-    // hex encode
     let mut s = String::with_capacity(48);
     for b in buf.iter() {
         s.push_str(&format!("{:02x}", b));
@@ -125,35 +131,33 @@ fn unlock_result_from(session: &Session) -> UnlockResult {
     }
 }
 
-fn require_session<'a>(inner: &'a mut Inner, token: &str) -> Result<&'a mut Session, String> {
-    let s = inner.session.as_mut().ok_or_else(|| "locked".to_string())?;
+fn require_session<'a>(inner: &'a mut Inner, token: &str) -> CmdResult<&'a mut Session> {
+    let s = inner.session.as_mut().ok_or(CommandError::Locked)?;
     if s.token != token {
-        return Err("invalid token".into());
+        return Err(CommandError::InvalidToken);
     }
     if Instant::now() >= s.expires_at {
         inner.session = None;
-        return Err("session expired".into());
+        return Err(CommandError::SessionExpired);
     }
     // Extend on use (sliding window).
     s.expires_at = Instant::now() + Duration::from_secs(SESSION_TTL_SECS);
     Ok(inner.session.as_mut().unwrap())
 }
 
-fn persist(state: &AppState, session: &Session) -> Result<(), String> {
-    let bytes = encrypt_to_bytes(&session.data, &session.key, &session.header)
-        .map_err(|e| e.to_string())?;
-    atomic_write(&state.vault_file, &bytes).map_err(|e| e.to_string())
+fn persist(state: &AppState, session: &Session) -> CmdResult<()> {
+    let bytes = encrypt_to_bytes(&session.data, &session.key, &session.header)?;
+    vault::write_vault(&state.vault_file, &bytes)?;
+    Ok(())
 }
 
-/// Reject the request if a cooldown is active. Returns the formatted error
-/// to bubble back to the UI.
-fn check_lockout(inner: &Inner) -> Result<(), String> {
+/// Reject the request if a cooldown is active.
+fn check_lockout(inner: &Inner) -> CmdResult<()> {
     if inner.lockout.is_locked() {
         let secs = inner.lockout.remaining_lock_secs();
-        return Err(format!(
-            "too many attempts; wait {}",
-            lockout::format_wait(secs)
-        ));
+        return Err(CommandError::LockedOut {
+            wait: lockout::format_wait(secs),
+        });
     }
     Ok(())
 }
@@ -185,12 +189,15 @@ pub fn lockout_status(state: State<AppState>) -> LockoutStatus {
 }
 
 #[tauri::command]
-pub async fn vault_init(pin: String, state: State<'_, AppState>) -> Result<UnlockResult, String> {
+pub async fn vault_init(pin: String, state: State<'_, AppState>) -> CmdResult<UnlockResult> {
     if state.vault_file.exists() {
-        return Err("vault already exists".into());
+        return Err(CommandError::VaultAlreadyExists);
     }
     if pin.is_empty() {
-        return Err("pin required".into());
+        return Err(CommandError::PinRequired);
+    }
+    if pin.chars().count() < MIN_PIN_LEN {
+        return Err(CommandError::PinTooShort { min: MIN_PIN_LEN });
     }
     // New vaults pick up the strength configured in settings.json (default
     // INTERACTIVE). Existing vaults keep whatever's stored in their header.
@@ -198,10 +205,10 @@ pub async fn vault_init(pin: String, state: State<'_, AppState>) -> Result<Unloc
     let strength = KdfStrength::parse(&cfg.kdf_strength).unwrap_or(KdfStrength::Interactive);
     let header = VaultHeader::new_with_strength(strength);
     let pin_secret = SecretString::from(pin);
-    let key = crate::vault::derive_key(&pin_secret, &header).map_err(|e| e.to_string())?;
+    let key = vault::derive_key(&pin_secret, Some(&state.device_secret), &header)?;
     let data = VaultData::default();
-    let bytes = encrypt_to_bytes(&data, &key, &header).map_err(|e| e.to_string())?;
-    atomic_write(&state.vault_file, &bytes).map_err(|e| e.to_string())?;
+    let bytes = encrypt_to_bytes(&data, &key, &header)?;
+    vault::write_vault(&state.vault_file, &bytes)?;
 
     let session = Session {
         token: make_token(),
@@ -220,19 +227,45 @@ pub async fn vault_init(pin: String, state: State<'_, AppState>) -> Result<Unloc
     Ok(result)
 }
 
-#[tauri::command]
-pub async fn vault_unlock(pin: String, state: State<'_, AppState>) -> Result<UnlockResult, String> {
+/// Shared body for both `vault_unlock` (plain PIN) and
+/// `vault_unlock_challenge` (rolling-challenge PIN). Encapsulates the
+/// lockout/session/persist logic so both entry points stay in lockstep.
+async fn vault_unlock_inner(pin: String, state: &State<'_, AppState>) -> CmdResult<UnlockResult> {
     {
         let inner = state.inner.lock();
         check_lockout(&inner)?;
     }
     if !state.vault_file.exists() {
-        return Err("vault does not exist".into());
+        return Err(CommandError::VaultMissing);
     }
-    let bytes = read_all(&state.vault_file).map_err(|e| e.to_string())?;
+    let bytes = read_all(&state.vault_file)?;
     let pin_secret = SecretString::from(pin);
-    match decrypt_from_bytes(&bytes, &pin_secret) {
-        Ok((header, key, data)) => {
+    match decrypt_from_bytes(&bytes, &pin_secret, &state.device_secret) {
+        Ok((header, format, key, data)) => {
+            // Auto-migrate legacy v01 vaults to v02 on first successful
+            // unlock: rederive the key with the device_secret mixed in and
+            // rewrite the file. After this, the vault file alone is no
+            // longer brute-forceable.
+            let (key, header) = if format == VaultFormat::V1 {
+                // SbKey is `[u8; 32]` (Copy), so the legacy-derived key
+                // value goes out of scope below; libsodium clears the slot
+                // on drop. We rederive a v02 key with the device_secret
+                // mixed in and rewrite the file in-place.
+                let _ = key;
+                let new_key =
+                    match vault::derive_key(&pin_secret, Some(&state.device_secret), &header) {
+                        Ok(k) => k,
+                        Err(_) => {
+                            return Err(CommandError::Internal("v02 migration failed".into()))
+                        }
+                    };
+                if let Ok(new_bytes) = encrypt_to_bytes(&data, &new_key, &header) {
+                    let _ = vault::write_vault(&state.vault_file, &new_bytes);
+                }
+                (new_key, header)
+            } else {
+                (key, header)
+            };
             let session = Session {
                 token: make_token(),
                 key,
@@ -246,7 +279,7 @@ pub async fn vault_unlock(pin: String, state: State<'_, AppState>) -> Result<Unl
             inner.lockout.record_success();
             let snap = inner.lockout.clone();
             drop(inner);
-            persist_lockout(&state, &snap);
+            persist_lockout(state, &snap);
             Ok(result)
         }
         Err(_) => {
@@ -254,17 +287,97 @@ pub async fn vault_unlock(pin: String, state: State<'_, AppState>) -> Result<Unl
             let triggered = inner.lockout.record_failure();
             let snap = inner.lockout.clone();
             drop(inner);
-            persist_lockout(&state, &snap);
+            persist_lockout(state, &snap);
             if let Some(secs) = triggered {
-                Err(format!(
-                    "too many attempts; locked for {}",
-                    lockout::format_wait(secs)
-                ))
+                Err(CommandError::LockedOut {
+                    wait: lockout::format_wait(secs),
+                })
             } else {
-                Err("invalid pin".into())
+                Err(CommandError::InvalidPin)
             }
         }
     }
+}
+
+#[tauri::command]
+pub async fn vault_unlock(pin: String, state: State<'_, AppState>) -> CmdResult<UnlockResult> {
+    vault_unlock_inner(pin, &state).await
+}
+
+/// Rolling-challenge unlock.
+///
+/// The frontend displays a per-attempt `challenge` of 4 Base36 characters
+/// (`0-9A-Z`, value 0..36) and the user types a 4-character Base36
+/// `response`. For each position:
+///
+///     response[i] = base36_char( (pin[i] + val(challenge[i])) mod 36 )
+///
+/// The backend recovers the PIN deterministically:
+///
+///     pin[i] = (val(response[i]) - val(challenge[i]) + 36) mod 36
+///
+/// Each recovered digit must be in 0..10 (since real PINs are decimal); a
+/// response that decodes to a value ≥ 10 in any slot is rejected as
+/// malformed input — *not* counted as a wrong-PIN attempt against the
+/// lockout, since it can't possibly match any real PIN.
+///
+/// Properties:
+/// - Typed characters change every attempt (challenge rotates), so a
+///   keystroke-only observer learns nothing reusable.
+/// - Exactly one PIN candidate per (challenge, response), so the server
+///   runs only a single (expensive) Argon2id derivation per attempt.
+///
+/// Caveat: this only defends against keystroke-only observers. An attacker
+/// who sees the screen + the keystrokes can recover the PIN trivially —
+/// the real defence against an exfiltrated `vault.bin` is the device
+/// secret mixed into the Argon2id input (see `vault.rs`).
+#[derive(Deserialize)]
+pub struct ChallengeUnlockInput {
+    challenge: String,
+    response: String,
+}
+
+/// Map a Base36 char (`0-9`, `A-Z`, `a-z`) to its 0..36 value.
+fn base36_value(c: char) -> Option<u32> {
+    c.to_digit(36)
+}
+
+fn decode_challenge_pin(challenge: &str, response: &str) -> CmdResult<String> {
+    if challenge.chars().count() != response.chars().count() {
+        return Err(CommandError::BadInput(
+            "challenge/response length mismatch".into(),
+        ));
+    }
+    if challenge.is_empty() {
+        return Err(CommandError::PinRequired);
+    }
+    let mut pin = String::with_capacity(challenge.chars().count());
+    for (cc, rc) in challenge.chars().zip(response.chars()) {
+        let cn = base36_value(cc)
+            .ok_or_else(|| CommandError::BadInput("challenge must be base36".into()))?;
+        let rn = base36_value(rc)
+            .ok_or_else(|| CommandError::BadInput("response must be base36".into()))?;
+        // Reverse the mod-36 add. Cast through i32 to keep the subtraction
+        // honest, then collapse back into 0..36.
+        let pd = ((rn as i32 - cn as i32).rem_euclid(36)) as u32;
+        // Real PIN digits are 0..10. Any response that decodes to ≥ 10 is
+        // structurally impossible — reject as malformed instead of charging
+        // a real attempt against the lockout schedule.
+        if pd >= 10 {
+            return Err(CommandError::InvalidPin);
+        }
+        pin.push(char::from_digit(pd, 10).unwrap());
+    }
+    Ok(pin)
+}
+
+#[tauri::command]
+pub async fn vault_unlock_challenge(
+    input: ChallengeUnlockInput,
+    state: State<'_, AppState>,
+) -> CmdResult<UnlockResult> {
+    let pin = decode_challenge_pin(&input.challenge, &input.response)?;
+    vault_unlock_inner(pin, &state).await
 }
 
 #[tauri::command]
@@ -279,184 +392,8 @@ pub fn lock_session(state: &AppState) {
     inner.session = None;
 }
 
-// ─── Challenge-response unlock ───
-//
-// Frontend shows a 4-char "challenge" above the OTP. User types a 4-char
-// "response" computed per-slot from their PIN:
-//
-//   challenge[i] is digit 0-9  →  response[i] = base19(pin[i] + challenge[i])
-//   challenge[i] is letter A-Z →  response[i] = challenge[i]   (PIN digit masked)
-//
-// base19 alphabet: 0..9, A..I (10..18).
-//
-// To avoid huge brute-force over masked PIN digits, the frontend SHOULD limit
-// the number of letter slots in the challenge. This command refuses challenges
-// with more than `MAX_CHALLENGE_LETTERS` letters.
-
-const MAX_CHALLENGE_LETTERS: usize = 1;
-
-#[derive(Deserialize)]
-pub struct ChallengeUnlockInput {
-    challenge: String,
-    response: String,
-}
-
-fn base19_decode(c: char) -> Option<u32> {
-    let c = c.to_ascii_uppercase();
-    match c {
-        '0'..='9' => c.to_digit(10),
-        'A'..='I' => Some(10 + (c as u32 - 'A' as u32)),
-        _ => None,
-    }
-}
-
-/// Decode (challenge, response) into a list of candidate PIN strings.
-/// Returns Err on malformed input.
-fn candidates_from_challenge(challenge: &str, response: &str) -> Result<Vec<String>, String> {
-    let ch: Vec<char> = challenge.chars().collect();
-    let rs: Vec<char> = response.chars().collect();
-    if ch.len() != 4 || rs.len() != 4 {
-        return Err("challenge/response must be 4 chars".into());
-    }
-
-    // Per-slot: either (fixed digit, Some(d)) or (letter mask, None).
-    let mut slots: Vec<Option<u32>> = Vec::with_capacity(4);
-    let mut letter_count = 0usize;
-
-    for i in 0..4 {
-        let c = ch[i];
-        let r = rs[i];
-        if c.is_ascii_digit() {
-            let cn = c.to_digit(10).unwrap();
-            let rn = base19_decode(r).ok_or("invalid response char")?;
-            let pd = (rn + 19 - cn) % 19;
-            if pd >= 10 {
-                return Err("invalid response".into());
-            }
-            slots.push(Some(pd));
-        } else if c.is_ascii_alphabetic() {
-            if r.to_ascii_uppercase() != c.to_ascii_uppercase() {
-                return Err("invalid response".into());
-            }
-            letter_count += 1;
-            slots.push(None);
-        } else {
-            return Err("invalid challenge char".into());
-        }
-    }
-    if letter_count > MAX_CHALLENGE_LETTERS {
-        return Err("challenge has too many letters".into());
-    }
-
-    // Enumerate candidates (cartesian product over unknown slots).
-    let mut out: Vec<String> = vec![String::with_capacity(4)];
-    for slot in slots {
-        match slot {
-            Some(d) => {
-                for s in out.iter_mut() {
-                    s.push(char::from_digit(d, 10).unwrap());
-                }
-            }
-            None => {
-                let mut next = Vec::with_capacity(out.len() * 10);
-                for s in &out {
-                    for d in 0..10u32 {
-                        let mut ns = s.clone();
-                        ns.push(char::from_digit(d, 10).unwrap());
-                        next.push(ns);
-                    }
-                }
-                out = next;
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[tauri::command]
-pub async fn vault_unlock_challenge(
-    input: ChallengeUnlockInput,
-    state: State<'_, AppState>,
-) -> Result<UnlockResult, String> {
-    {
-        let inner = state.inner.lock();
-        check_lockout(&inner)?;
-    }
-    if !state.vault_file.exists() {
-        return Err("vault does not exist".into());
-    }
-    let candidates = candidates_from_challenge(&input.challenge, &input.response)?;
-    let bytes = read_all(&state.vault_file).map_err(|e| e.to_string())?;
-
-    // Try candidates in parallel batches. Each Argon2id MODERATE call allocates
-    // ~256 MiB, so cap concurrency to keep peak RAM bounded on small machines.
-    let max_par = std::thread::available_parallelism()
-        .map(|n| n.get().min(3))
-        .unwrap_or(2);
-
-    let mut found: Option<(VaultHeader, SbKey, VaultData)> = None;
-    'outer: for chunk in candidates.chunks(max_par) {
-        let bytes_ref = &bytes;
-        let result = std::thread::scope(|s| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|pin| {
-                    let pin = pin.clone();
-                    s.spawn(move || {
-                        let secret = SecretString::from(pin);
-                        decrypt_from_bytes(bytes_ref, &secret).ok()
-                    })
-                })
-                .collect();
-            let mut hit = None;
-            for h in handles {
-                if let Ok(Some(v)) = h.join() {
-                    hit = Some(v);
-                }
-            }
-            hit
-        });
-        if let Some(v) = result {
-            found = Some(v);
-            break 'outer;
-        }
-    }
-
-    if let Some((header, key, data)) = found {
-        let session = Session {
-            token: make_token(),
-            key,
-            header,
-            data,
-            expires_at: Instant::now() + Duration::from_secs(SESSION_TTL_SECS),
-        };
-        let result = unlock_result_from(&session);
-        let mut inner = state.inner.lock();
-        inner.session = Some(session);
-        inner.lockout.record_success();
-        let snap = inner.lockout.clone();
-        drop(inner);
-        persist_lockout(&state, &snap);
-        return Ok(result);
-    }
-
-    let mut inner = state.inner.lock();
-    let triggered = inner.lockout.record_failure();
-    let snap = inner.lockout.clone();
-    drop(inner);
-    persist_lockout(&state, &snap);
-    if let Some(secs) = triggered {
-        Err(format!(
-            "too many attempts; locked for {}",
-            lockout::format_wait(secs)
-        ))
-    } else {
-        Err("invalid pin".into())
-    }
-}
-
-#[tauri::command]
-pub fn session_touch(token: String, state: State<AppState>) -> Result<u64, String> {
+pub fn session_touch(token: String, state: State<AppState>) -> CmdResult<u64> {
     let mut inner = state.inner.lock();
     let s = require_session(&mut inner, &token)?;
     Ok(s.expires_at
@@ -465,45 +402,69 @@ pub fn session_touch(token: String, state: State<AppState>) -> Result<u64, Strin
 }
 
 #[tauri::command]
-pub fn list_entries(token: String, state: State<AppState>) -> Result<Vec<EntryMeta>, String> {
+pub fn list_entries(token: String, state: State<AppState>) -> CmdResult<Vec<EntryMeta>> {
     let mut inner = state.inner.lock();
     let s = require_session(&mut inner, &token)?;
     Ok(s.data.entries.iter().map(EntryMeta::from).collect())
 }
 
-/// Cheap pre-flight check that runs while we still hold the mutex. Returns
-/// `Ok(Some(hash))` when the caller must verify a custom PIN off-thread,
-/// `Ok(None)` when no further check is needed, and `Err` for the obvious
-/// failure cases (locked, missing pin, no such entry).
-fn authorize_entry_prepare(
-    entry: &Entry,
-    pin: &Option<String>,
-    global_unlocked: bool,
-) -> Result<Option<PinHash>, String> {
-    if entry.use_default_pin {
-        // Global session already verified — the main unlock IS the default-PIN check.
-        if global_unlocked {
-            return Ok(None);
-        }
-        return Err("locked".into());
-    }
-    match (&entry.custom_pin, pin) {
-        (None, _) => Ok(None),
-        (Some(_), None) => Err("pin required".into()),
-        (Some(h), Some(_)) => Ok(Some(h.clone())),
-    }
+/// Authorization required for an entry's password, captured under the lock
+/// so we can release the mutex before running expensive Argon2id work.
+enum AuthRequest {
+    None {
+        password: String,
+    },
+    Decrypt(vault::CustomSecret),
+    Legacy {
+        hash: vault::PinHash,
+        password: String,
+    },
 }
 
-/// Run the Argon2id verification on Tauri's blocking pool so the main thread
-/// stays responsive (a single Interactive verify is ~64 MiB / ~50–500 ms).
-async fn verify_entry_pin_async(hash: PinHash, pin: String) -> Result<(), String> {
-    let ok = tauri::async_runtime::spawn_blocking(move || verify_entry_pin(&hash, &pin))
-        .await
-        .map_err(|e| e.to_string())?;
-    if ok {
-        Ok(())
-    } else {
-        Err("invalid pin".into())
+fn authorize_entry_password(entry: &Entry, pin: &Option<String>) -> CmdResult<AuthRequest> {
+    if let Some(secret) = entry.custom_secret.as_ref() {
+        let _ = pin.as_ref().ok_or(CommandError::PinRequired)?;
+        return Ok(AuthRequest::Decrypt(secret.clone()));
+    }
+    if let Some(hash) = entry.custom_pin.as_ref() {
+        let _ = pin.as_ref().ok_or(CommandError::PinRequired)?;
+        return Ok(AuthRequest::Legacy {
+            hash: hash.clone(),
+            password: entry.password.clone(),
+        });
+    }
+    Ok(AuthRequest::None {
+        password: entry.password.clone(),
+    })
+}
+
+async fn resolve_password(
+    req: AuthRequest,
+    pin: Option<String>,
+    device_secret: DeviceSecret,
+) -> CmdResult<String> {
+    match req {
+        AuthRequest::None { password } => Ok(password),
+        AuthRequest::Decrypt(secret) => {
+            let pin = pin.expect("pin checked");
+            let res = tauri::async_runtime::spawn_blocking(move || {
+                open_entry_secret(&secret, &pin, &device_secret)
+            })
+            .await
+            .map_err(|e| CommandError::Internal(e.to_string()))?;
+            res.map_err(CommandError::from)
+        }
+        AuthRequest::Legacy { hash, password } => {
+            let pin = pin.expect("pin checked");
+            let ok = tauri::async_runtime::spawn_blocking(move || verify_entry_pin(&hash, &pin))
+                .await
+                .map_err(|e| CommandError::Internal(e.to_string()))?;
+            if ok {
+                Ok(password)
+            } else {
+                Err(CommandError::InvalidPin)
+            }
+        }
     }
 }
 
@@ -513,10 +474,8 @@ pub async fn get_entry_secret(
     id: Uuid,
     pin: Option<String>,
     state: State<'_, AppState>,
-) -> Result<String, String> {
-    // Snapshot what we need under the lock, then drop it before the (possibly
-    // expensive) Argon2id verify so the UI thread isn't blocked.
-    let (need_verify, password) = {
+) -> CmdResult<String> {
+    let req = {
         let mut inner = state.inner.lock();
         let s = require_session(&mut inner, &token)?;
         let entry = s
@@ -524,23 +483,14 @@ pub async fn get_entry_secret(
             .entries
             .iter()
             .find(|e| e.id == id)
-            .ok_or_else(|| "not found".to_string())?;
-        let need = authorize_entry_prepare(entry, &pin, true)?;
-        (need, entry.password.clone())
+            .ok_or(CommandError::NotFound)?;
+        authorize_entry_password(entry, &pin)?
     };
-    if let Some(hash) = need_verify {
-        // Safe: authorize_entry_prepare returns Some(hash) only when pin is Some.
-        verify_entry_pin_async(hash, pin.unwrap()).await?;
-    }
-    Ok(password)
+    resolve_password(req, pin, state.device_secret).await
 }
 
 #[tauri::command]
-pub fn get_entry_username(
-    token: String,
-    id: Uuid,
-    state: State<AppState>,
-) -> Result<String, String> {
+pub fn get_entry_username(token: String, id: Uuid, state: State<AppState>) -> CmdResult<String> {
     let mut inner = state.inner.lock();
     let s = require_session(&mut inner, &token)?;
     let entry = s
@@ -548,7 +498,7 @@ pub fn get_entry_username(
         .entries
         .iter()
         .find(|e| e.id == id)
-        .ok_or_else(|| "not found".to_string())?;
+        .ok_or(CommandError::NotFound)?;
     Ok(entry.username.clone())
 }
 
@@ -557,38 +507,47 @@ pub async fn add_entry(
     token: String,
     input: AddEntryInput,
     state: State<'_, AppState>,
-) -> Result<EntryMeta, String> {
+) -> CmdResult<EntryMeta> {
     let title = input.title.trim().to_string();
     if title.is_empty() {
-        return Err("title required".into());
+        return Err(CommandError::BadInput("title required".into()));
     }
-    // Lock briefly to read the vault's KDF cost; release before doing the
-    // expensive hash so the UI thread isn't blocked.
     let (vault_ops, vault_mem) = {
         let mut inner = state.inner.lock();
         let s = require_session(&mut inner, &token)?;
         (s.header.opslimit, s.header.memlimit)
     };
 
-    let custom = if !input.use_default_pin {
+    // Per-entry encryption: when the user sets a custom PIN, encrypt the
+    // password under a key derived from that PIN — independent of the vault
+    // key. Without the PIN, the password is unrecoverable even with full
+    // access to the unlocked vault in memory.
+    let mut password = input.password;
+    let custom_secret = if !input.use_default_pin {
         match input.custom_pin.as_ref() {
             Some(p) if !p.is_empty() => {
-                // Argon2id is CPU+memory heavy (~64 MiB at Interactive). Run it
-                // on the blocking pool so the Tauri main thread stays responsive.
+                if p.chars().count() < MIN_PIN_LEN {
+                    password.zeroize();
+                    return Err(CommandError::PinTooShort { min: MIN_PIN_LEN });
+                }
                 let pin = p.clone();
-                let hashed = tauri::async_runtime::spawn_blocking(move || {
-                    hash_entry_pin_with(&pin, vault_ops, vault_mem)
+                let pw = password.clone();
+                let ds = state.device_secret;
+                let secret = tauri::async_runtime::spawn_blocking(move || {
+                    seal_entry_secret(&pin, &ds, &pw, vault_ops, vault_mem)
                 })
                 .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
-                Some(hashed)
+                .map_err(|e| CommandError::Internal(e.to_string()))??;
+                password.zeroize();
+                password = String::new();
+                Some(secret)
             }
             _ => None,
         }
     } else {
         None
     };
+
     let now = now_unix();
     let entry = Entry {
         id: Uuid::new_v4(),
@@ -599,9 +558,10 @@ pub async fn add_entry(
         } else {
             String::new()
         },
-        password: input.password,
+        password,
         use_default_pin: input.use_default_pin,
-        custom_pin: custom,
+        custom_pin: None,
+        custom_secret,
         created_at: now,
         updated_at: now,
     };
@@ -620,9 +580,8 @@ pub async fn delete_entry(
     id: Uuid,
     pin: Option<String>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Verify off-thread before mutating, so the lock isn't held during Argon2id.
-    let need_verify = {
+) -> CmdResult<()> {
+    let req = {
         let mut inner = state.inner.lock();
         let s = require_session(&mut inner, &token)?;
         let entry = s
@@ -630,12 +589,12 @@ pub async fn delete_entry(
             .entries
             .iter()
             .find(|e| e.id == id)
-            .ok_or_else(|| "not found".to_string())?;
-        authorize_entry_prepare(entry, &pin, true)?
+            .ok_or(CommandError::NotFound)?;
+        authorize_entry_password(entry, &pin)?
     };
-    if let Some(hash) = need_verify {
-        verify_entry_pin_async(hash, pin.unwrap()).await?;
-    }
+    // Discard the plaintext — we just want the PIN gate.
+    let _ = resolve_password(req, pin, state.device_secret).await?;
+
     let mut inner = state.inner.lock();
     let s = require_session(&mut inner, &token)?;
     let pos = s
@@ -643,7 +602,7 @@ pub async fn delete_entry(
         .entries
         .iter()
         .position(|e| e.id == id)
-        .ok_or_else(|| "not found".to_string())?;
+        .ok_or(CommandError::NotFound)?;
     s.data.entries.remove(pos);
     persist(&state, s)
 }
@@ -655,10 +614,9 @@ pub async fn copy_to_clipboard(
     id: Uuid,
     field: String, // "password" | "username"
     pin: Option<String>,
-) -> Result<(), String> {
+) -> CmdResult<()> {
     let state = app.state::<AppState>();
-    // Snapshot under the lock; verify (if needed) after dropping it.
-    let (need_verify, value) = {
+    let (req, username) = {
         let mut inner = state.inner.lock();
         let s = require_session(&mut inner, &token)?;
         let entry = s
@@ -666,23 +624,22 @@ pub async fn copy_to_clipboard(
             .entries
             .iter()
             .find(|e| e.id == id)
-            .ok_or_else(|| "not found".to_string())?;
+            .ok_or(CommandError::NotFound)?;
         match field.as_str() {
-            "password" => {
-                let need = authorize_entry_prepare(entry, &pin, true)?;
-                (need, entry.password.clone())
-            }
-            "username" => (None, entry.username.clone()),
-            _ => return Err("bad field".into()),
+            "password" => (Some(authorize_entry_password(entry, &pin)?), None),
+            "username" => (None, Some(entry.username.clone())),
+            _ => return Err(CommandError::BadInput("bad field".into())),
         }
     };
-    if let Some(hash) = need_verify {
-        verify_entry_pin_async(hash, pin.unwrap()).await?;
-    }
+    let value = if let Some(req) = req {
+        resolve_password(req, pin, state.device_secret).await?
+    } else {
+        username.unwrap_or_default()
+    };
 
     app.clipboard()
         .write_text(value.clone())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CommandError::Internal(e.to_string()))?;
 
     // Schedule auto-clear: only clear if clipboard still contains our value.
     let app2 = app.clone();
@@ -698,9 +655,6 @@ pub async fn copy_to_clipboard(
 }
 
 // ─── Settings (theme + UI scale) ───
-//
-// Persisted as plain JSON in `app_data_dir/settings.json`. Auto-created with
-// defaults on first read. Not encrypted: holds no secrets.
 
 #[tauri::command]
 pub fn settings_get(state: State<AppState>) -> Settings {
@@ -708,21 +662,13 @@ pub fn settings_get(state: State<AppState>) -> Settings {
 }
 
 #[tauri::command]
-pub fn settings_set(settings_input: Settings, state: State<AppState>) -> Result<Settings, String> {
+pub fn settings_set(settings_input: Settings, state: State<AppState>) -> CmdResult<Settings> {
     let sanitized = settings_input.sanitize();
-    settings::save(&state.settings_file, &sanitized).map_err(|e| e.to_string())?;
+    settings::save(&state.settings_file, &sanitized)?;
     Ok(sanitized)
 }
 
 // ─── Vault rekey & strength inspection ───
-//
-// `vault_rekey` re-encrypts the vault under a new KDF strength and/or a new
-// PIN. It also re-hashes every per-entry custom PIN at the new strength so a
-// downgrade really does become cheap (and an upgrade really does become
-// stronger).
-//
-// The current PIN must be supplied so we can decrypt the existing vault —
-// session unlock alone isn't enough because we don't keep the PIN around.
 
 #[derive(Deserialize)]
 pub struct RekeyInput {
@@ -734,10 +680,8 @@ pub struct RekeyInput {
     strength: String,
 }
 
-/// Returns the current vault's KDF strength label (or "unknown" if the stored
-/// `(opslimit, memlimit)` doesn't match a libsodium preset).
 #[tauri::command]
-pub fn vault_strength(token: String, state: State<AppState>) -> Result<String, String> {
+pub fn vault_strength(token: String, state: State<AppState>) -> CmdResult<String> {
     let mut inner = state.inner.lock();
     let s = require_session(&mut inner, &token)?;
     let label = if (s.header.opslimit, s.header.memlimit) == KdfStrength::Interactive.params() {
@@ -757,27 +701,27 @@ pub async fn vault_rekey(
     token: String,
     input: RekeyInput,
     state: State<'_, AppState>,
-) -> Result<UnlockResult, String> {
-    // 1. Validate strength + grab vault path while holding the lock briefly.
-    let new_strength =
-        KdfStrength::parse(&input.strength).ok_or_else(|| "invalid strength".to_string())?;
+) -> CmdResult<UnlockResult> {
+    let new_strength = KdfStrength::parse(&input.strength).ok_or(CommandError::UnknownStrength)?;
     let vault_path = state.vault_file.clone();
     {
         let mut inner = state.inner.lock();
-        // Require an active session — token must be valid.
         let _ = require_session(&mut inner, &token)?;
     }
 
-    // 2. Decrypt under the current PIN (off the lock — this is expensive).
-    let bytes = read_all(&vault_path).map_err(|e| e.to_string())?;
+    let bytes = read_all(&vault_path)?;
     let cur_secret = SecretString::from(input.current_pin);
-    let (_old_header, _old_key, mut data) =
-        decrypt_from_bytes(&bytes, &cur_secret).map_err(|_| "current pin invalid".to_string())?;
+    let (_old_header, _old_format, _old_key, mut data) =
+        decrypt_from_bytes(&bytes, &cur_secret, &state.device_secret)
+            .map_err(|_| CommandError::InvalidPin)?;
 
-    // 3. Build the new header at the requested strength and derive a new key
-    //    from the (possibly new) PIN.
     let new_pin_string = match input.new_pin {
-        Some(s) if !s.is_empty() => s,
+        Some(s) if !s.is_empty() => {
+            if s.chars().count() < MIN_PIN_LEN {
+                return Err(CommandError::PinTooShort { min: MIN_PIN_LEN });
+            }
+            s
+        }
         _ => {
             use secrecy::ExposeSecret;
             cur_secret.expose_secret().to_string()
@@ -785,27 +729,16 @@ pub async fn vault_rekey(
     };
     let new_secret = SecretString::from(new_pin_string);
     let new_header = VaultHeader::new_with_strength(new_strength);
-    let new_key = crate::vault::derive_key(&new_secret, &new_header).map_err(|e| e.to_string())?;
+    let new_key = vault::derive_key(&new_secret, Some(&state.device_secret), &new_header)?;
 
-    // 4. Re-hash every per-entry custom PIN at the new cost. We can only do
-    //    this if we know the plaintext PINs — we don't. So instead we leave
-    //    custom-PIN hashes alone (they already encode their own params and
-    //    will keep verifying). If the user wants entry PINs at the new cost,
-    //    they should re-set them via add/edit. We log nothing here — the UI
-    //    will surface this in the rekey dialog text.
-    //
-    //    However, we *do* clear stale fields and bump updated_at on entries
-    //    so the on-disk timestamp reflects the rekey.
     let now = now_unix();
     for e in data.entries.iter_mut() {
         e.updated_at = now;
     }
 
-    // 5. Encrypt with the new header/key and write atomically.
-    let new_bytes = encrypt_to_bytes(&data, &new_key, &new_header).map_err(|e| e.to_string())?;
-    atomic_write(&vault_path, &new_bytes).map_err(|e| e.to_string())?;
+    let new_bytes = encrypt_to_bytes(&data, &new_key, &new_header)?;
+    vault::write_vault(&vault_path, &new_bytes)?;
 
-    // 6. Replace the live session.
     let session = Session {
         token: make_token(),
         key: new_key,

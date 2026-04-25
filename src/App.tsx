@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import React from "react";
 import {
   Search,
   Plus,
@@ -21,53 +22,11 @@ import { Checkbox } from "@/components/ui/checkbox";
 import {
   InputOTP,
   InputOTPGroup,
-  InputOTPSeparator,
 } from "@/components/ui/input-otp";
 import { OTPInputContext } from "input-otp";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
-import React from "react";
 import { cn } from "@/lib/utils";
-
-function MaskedOTPSlot({
-  index,
-  className,
-  status,
-  ...props
-}: React.ComponentProps<"div"> & {
-  index: number;
-  status?: "valid" | "invalid" | "busy" | null;
-}) {
-  const ctx = React.useContext(OTPInputContext);
-  const { char, hasFakeCaret, isActive } = ctx?.slots[index] ?? {};
-  const statusClass =
-    status === "valid"
-      ? "border-green-500 ring-1 ring-green-500/40"
-      : status === "invalid"
-      ? "border-red-500 ring-1 ring-red-500/40"
-      : status === "busy"
-      ? "border-primary/60 ring-1 ring-primary/30 animate-pulse"
-      : "";
-  return (
-    <div
-      data-slot="input-otp-slot"
-      data-active={isActive}
-      className={cn(
-        "relative flex size-5 items-center justify-center border-y border-r border-input text-[10px] transition-all outline-none first:rounded-l-sm first:border-l last:rounded-r-sm data-[active=true]:z-10 data-[active=true]:border-ring data-[active=true]:ring-1 data-[active=true]:ring-ring/50 dark:bg-input/30",
-        statusClass,
-        className
-      )}
-      {...props}
-    >
-      {char ? "∗" : null}
-      {hasFakeCaret && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <div className="h-3 w-px animate-caret-blink bg-foreground duration-1000" />
-        </div>
-      )}
-    </div>
-  );
-}
 
 interface EntryMeta {
   id: string;
@@ -94,7 +53,13 @@ type PendingAction =
   | { kind: "delete"; entryId: string };
 
 const SESSION_TTL_MS = 30_000;
+/// Fixed PIN length: a single group of 4 digits in the OTP UI. The 4-digit
+/// keyspace is only safe because every Argon2id derivation also mixes in a
+/// 32-byte device secret stored outside the vault file (`device_secret.bin`),
+/// so a stolen vault file alone cannot be brute-forced.
 const PIN_LEN = 4;
+/// How often the rolling unlock challenge regenerates while the lock
+/// screen is open. Each rotation also clears any partial response.
 const CHALLENGE_ROTATE_MS = 30_000;
 
 type Theme = "default" | "midnight" | "forest" | "mocha" | "rose";
@@ -164,20 +129,124 @@ function pickBusyPhrase(): string {
   return BUSY_PHRASES[buf[0] % BUSY_PHRASES.length];
 }
 
-/** Generate a 4-char challenge: 3 digits + 1 letter A-Z at a random slot. */
-function generateChallenge(): string {
-  const buf = new Uint32Array(5);
-  crypto.getRandomValues(buf);
-  const letterSlot = buf[0] % 4;
-  const chars: string[] = [];
-  for (let i = 0; i < 4; i++) {
-    if (i === letterSlot) {
-      chars.push(String.fromCharCode(65 + (buf[i + 1] % 26))); // A-Z
-    } else {
-      chars.push(String.fromCharCode(48 + (buf[i + 1] % 10))); // 0-9
+/// Backend errors come over Tauri's bridge as `{ kind, message }` objects
+/// (see `error::CommandError` in Rust). Older code threw raw strings, so we
+/// handle both shapes here.
+type BackendError = { kind: string; message?: unknown } | string;
+function errToText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object") {
+    const be = e as BackendError;
+    if (typeof be === "object" && "kind" in be) {
+      const msg =
+        typeof be.message === "string" && be.message ? be.message : be.kind;
+      return msg;
     }
   }
-  return chars.join("");
+  return String(e);
+}
+function errKind(e: unknown): string | null {
+  if (e && typeof e === "object" && "kind" in (e as object)) {
+    return (e as { kind: string }).kind;
+  }
+  return null;
+}
+
+/// One slot of the masked PIN OTP grid. Renders a small box that shows a `∗`
+/// when filled, mirrors active/caret state from input-otp's context, and
+/// accepts a status colour for valid/invalid/busy feedback.
+function MaskedOTPSlot({
+  index,
+  className,
+  status,
+  ...props
+}: React.ComponentProps<"div"> & {
+  index: number;
+  status?: "valid" | "invalid" | "busy" | null;
+}) {
+  const ctx = React.useContext(OTPInputContext);
+  const { char, hasFakeCaret, isActive } = ctx?.slots[index] ?? {};
+  const statusClass =
+    status === "valid"
+      ? "border-green-500 ring-1 ring-green-500/40"
+      : status === "invalid"
+      ? "border-red-500 ring-1 ring-red-500/40"
+      : status === "busy"
+      ? "border-primary/60 ring-1 ring-primary/30 animate-pulse"
+      : "";
+  return (
+    <div
+      data-slot="input-otp-slot"
+      data-active={isActive}
+      className={cn(
+        "relative flex size-5 items-center justify-center border-y border-r border-input text-[10px] transition-all outline-none first:rounded-l-[2px] first:border-l last:rounded-r-[2px] data-[active=true]:z-10 data-[active=true]:border-ring data-[active=true]:ring-1 data-[active=true]:ring-ring/50 dark:bg-input/30",
+        statusClass,
+        className
+      )}
+      {...props}
+    >
+      {char ? "∗" : null}
+      {hasFakeCaret && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <div className="h-3 w-px animate-caret-blink bg-foreground duration-1000" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// Single 4-slot masked PIN field. Accepts Base36 chars (`0-9A-Z`) so the
+/// challenge can rotate through the larger alphabet without changing the
+/// user's underlying numeric PIN.
+function PinOtp({
+  value,
+  onChange,
+  status,
+  autoFocus,
+  disabled,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  status?: "valid" | "invalid" | "busy" | null;
+  autoFocus?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <InputOTP
+      maxLength={PIN_LEN}
+      value={value}
+      onChange={(v) => onChange(v.toUpperCase())}
+      inputMode="text"
+      pattern="[0-9A-Za-z]*"
+      containerClassName="gap-1"
+      autoFocus={autoFocus}
+      disabled={disabled}
+    >
+      <InputOTPGroup>
+        <MaskedOTPSlot index={0} status={status} />
+        <MaskedOTPSlot index={1} status={status} />
+        <MaskedOTPSlot index={2} status={status} />
+        <MaskedOTPSlot index={3} status={status} />
+      </InputOTPGroup>
+    </InputOTP>
+  );
+}
+
+/// Generate a 4-character Base36 rolling challenge (`0-9A-Z`).
+///
+/// The user types
+/// `response[i] = base36( (pin[i] + val(challenge[i])) mod 36 )`
+/// per slot, so each unlock attempt produces different keystrokes for the
+/// same underlying numeric PIN. The server reverses the math
+/// deterministically — exactly one PIN candidate per attempt, so unlock
+/// stays a single Argon2id derivation.
+function generateChallenge(): string {
+  const ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const buf = new Uint32Array(PIN_LEN);
+  crypto.getRandomValues(buf);
+  let s = "";
+  for (let i = 0; i < PIN_LEN; i++) s += ALPHABET[buf[i] % 36];
+  return s;
 }
 
 function App() {
@@ -201,6 +270,7 @@ function App() {
   const [newCustomPin, setNewCustomPin] = useState("");
 
   const [unlockPin, setUnlockPin] = useState("");
+  const [unlockBusy, setUnlockBusy] = useState(false);
   const [unlockStatus, setUnlockStatus] = useState<
     "valid" | "invalid" | "busy" | null
   >(null);
@@ -222,6 +292,7 @@ function App() {
   const [actionStatus, setActionStatus] = useState<"valid" | "invalid" | null>(
     null
   );
+  const [actionBusy, setActionBusy] = useState(false);
 
   const [theme, setTheme] = useState<Theme>("default");
   const [uiScale, setUiScale] = useState<number>(1.2);
@@ -323,8 +394,6 @@ function App() {
     const iv = window.setInterval(() => {
       setLockoutSecs((s) => {
         if (s <= 1) {
-          // Cooldown just hit zero — re-sync with backend so threshold and
-          // attempt counters reflect the post-lockout state (3 attempts).
           window.setTimeout(() => refreshLockout(), 0);
           return 0;
         }
@@ -357,13 +426,23 @@ function App() {
       .catch(() => setPhase("setup"));
   }, []);
 
+  // Session TTL countdown — locks the vault when the timer runs out.
+  // Skipped while the user is actively filling out a form (add/set-pin) or
+  // an action overlay is open, since those flows can legitimately take
+  // longer than the idle TTL and locking out mid-typing wipes their work.
   useEffect(() => {
     if (phase !== "unlocked") return;
+    const inForm = view !== "list" || pendingAction !== null || rekeyOpen;
     const iv = window.setInterval(() => {
+      if (inForm) {
+        // Keep the session warm so we don't drop the moment the user finishes.
+        touchSession();
+        return;
+      }
       if (Date.now() >= expiresAt) doLock();
     }, 500);
     return () => window.clearInterval(iv);
-  }, [phase, expiresAt, doLock]);
+  }, [phase, expiresAt, doLock, view, pendingAction, rekeyOpen, touchSession]);
 
   useEffect(() => {
     if (!revealKey) return;
@@ -371,9 +450,14 @@ function App() {
     return () => window.clearTimeout(t);
   }, [revealKey]);
 
-  useEffect(() => {
-    if (phase !== "setup" || setupPin.length !== PIN_LEN) return;
+  const submitSetup = useCallback(() => {
+    if (phase !== "setup") return;
+    if (setupPin.length !== PIN_LEN) {
+      setUnlockError(`PIN must be ${PIN_LEN} digits`);
+      return;
+    }
     setUnlockStatus("busy");
+    setUnlockError(null);
     setBusyPhrase(pickBusyPhrase());
     invoke<UnlockResult>("vault_init", { pin: setupPin })
       .then((r) => {
@@ -388,18 +472,24 @@ function App() {
       .catch((e) => {
         setUnlockStatus(null);
         setBusyPhrase(null);
-        setUnlockError(String(e));
+        setUnlockError(errToText(e));
         setSetupPin("");
       });
   }, [phase, setupPin]);
 
-  useEffect(() => {
-    if (phase !== "locked" || unlockPin.length !== PIN_LEN) return;
-    if (lockoutSecs > 0) return;
+  const submitUnlock = useCallback(() => {
+    if (phase !== "locked") return;
+    if (lockoutSecs > 0 || unlockBusy) return;
+    if (unlockPin.length !== PIN_LEN) return;
+    setUnlockBusy(true);
     setUnlockStatus("busy");
+    setUnlockError(null);
     setBusyPhrase(pickBusyPhrase());
+    // The user typed `response[i] = (pin[i] + challenge[i]) mod 10`. The
+    // backend reverses that to recover the real PIN, so what was typed is
+    // never the same twice for the same vault PIN.
     invoke<UnlockResult>("vault_unlock_challenge", {
-      input: { challenge, response: unlockPin.toUpperCase() },
+      input: { challenge, response: unlockPin },
     })
       .then((r) => {
         setUnlockStatus("valid");
@@ -411,6 +501,7 @@ function App() {
           setUnlockPin("");
           setUnlockStatus(null);
           setUnlockError(null);
+          setUnlockBusy(false);
           setPhase("unlocked");
         }, 200);
         refreshLockout();
@@ -418,16 +509,39 @@ function App() {
       .catch((e) => {
         setUnlockStatus("invalid");
         setBusyPhrase(null);
-        setUnlockError(String(e));
+        setUnlockError(errToText(e));
+        // Rotate the challenge on a failed attempt so the next try has a
+        // fresh code (also drops the partial response).
+        setChallenge(generateChallenge());
+        setChallengeExpiresAt(Date.now() + CHALLENGE_ROTATE_MS);
         window.setTimeout(() => {
           setUnlockPin("");
           setUnlockStatus(null);
+          setUnlockBusy(false);
         }, 600);
         refreshLockout();
       });
-  }, [phase, unlockPin]);
+  }, [phase, lockoutSecs, unlockBusy, unlockPin, challenge, refreshLockout]);
 
-  // Schedule rotation precisely at expiry so there's no visible gap after drain.
+  // Auto-submit when the OTP is full. PIN is fixed-length (8 digits) so
+  // this triggers once the last slot is filled.
+  useEffect(() => {
+    if (phase === "setup" && setupPin.length === PIN_LEN) {
+      submitSetup();
+    }
+  }, [phase, setupPin, submitSetup]);
+  useEffect(() => {
+    if (
+      phase === "locked" &&
+      unlockPin.length === PIN_LEN &&
+      !unlockBusy &&
+      lockoutSecs === 0
+    ) {
+      submitUnlock();
+    }
+  }, [phase, unlockPin, unlockBusy, lockoutSecs, submitUnlock]);
+
+  // Rotate the rolling challenge on a timer while the lock screen is open.
   useEffect(() => {
     if (phase !== "locked") return;
     const delay = Math.max(0, challengeExpiresAt - Date.now());
@@ -439,7 +553,8 @@ function App() {
     }, delay);
     return () => window.clearTimeout(t);
   }, [phase, challengeExpiresAt]);
-  // Fresh challenge whenever we enter the locked phase.
+
+  // Fresh challenge whenever we (re)enter the locked phase.
   useEffect(() => {
     if (phase === "locked") {
       setChallenge(generateChallenge());
@@ -501,7 +616,7 @@ function App() {
       resetAddForm();
       setView("list");
     } catch (e) {
-      setUnlockError(String(e));
+      setUnlockError(errToText(e));
     }
   };
 
@@ -517,6 +632,7 @@ function App() {
 
   const runAction = async (action: PendingAction, pin?: string) => {
     if (!token) return;
+    setActionBusy(true);
     try {
       if (action.kind === "reveal") {
         const value = await invoke<string>(
@@ -550,8 +666,8 @@ function App() {
       setActionPin("");
       setActionStatus(null);
     } catch (e) {
-      const msg = String(e);
-      if (msg.includes("invalid pin")) {
+      const kind = errKind(e);
+      if (kind === "invalid-pin" || errToText(e).includes("invalid pin")) {
         setActionStatus("invalid");
         window.setTimeout(() => {
           setActionPin("");
@@ -562,6 +678,8 @@ function App() {
         setActionPin("");
         setActionStatus(null);
       }
+    } finally {
+      setActionBusy(false);
     }
   };
 
@@ -587,15 +705,19 @@ function App() {
     runAction(action);
   };
 
-  useEffect(() => {
+  const submitActionPin = useCallback(() => {
     if (!pendingAction) return;
-    if (actionPin.length !== PIN_LEN) {
-      setActionStatus(null);
-      return;
-    }
+    if (actionPin.length === 0 || actionBusy) return;
     runAction(pendingAction, actionPin);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actionPin]);
+  }, [pendingAction, actionPin, actionBusy]);
+
+  // Auto-submit the action PIN once all 8 digits are entered.
+  useEffect(() => {
+    if (pendingAction && actionPin.length === PIN_LEN && !actionBusy) {
+      submitActionPin();
+    }
+  }, [pendingAction, actionPin, actionBusy, submitActionPin]);
 
   const titleBar = (
     <div
@@ -670,7 +792,11 @@ function App() {
           <ShieldX className="size-4" />
         </Button>
       </div>
-      {phase === "locked" && (
+      {phase === "locked" && lockoutSecs === 0 && (
+        // Two halves drain inward (left-anchored shrinks left, right-anchored
+        // shrinks right) over CHALLENGE_ROTATE_MS, with a colour ramp from
+        // green to red and a pulse in the final seconds. Re-keyed on every
+        // challenge rotation so the animation restarts in lockstep.
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px">
           <div
             className="absolute inset-x-0 top-0 h-px"
@@ -697,29 +823,13 @@ function App() {
         Create Vault
       </span>
       <span className="text-[9px] text-muted-foreground text-center">
-        Choose a 4-digit PIN.
+        Choose an {PIN_LEN}-digit PIN.
       </span>
-      <InputOTP
-        maxLength={PIN_LEN}
-        value={setupPin}
-        onChange={setSetupPin}
-        inputMode="numeric"
-        pattern="[0-9]*"
-        containerClassName="gap-1"
-        autoFocus
-      >
-        <InputOTPGroup>
-          <MaskedOTPSlot index={0} />
-          <MaskedOTPSlot index={1} />
-        </InputOTPGroup>
-        <InputOTPSeparator />
-        <InputOTPGroup>
-          <MaskedOTPSlot index={2} />
-          <MaskedOTPSlot index={3} />
-        </InputOTPGroup>
-      </InputOTP>
+      <PinOtp value={setupPin} onChange={setSetupPin} autoFocus />
       {unlockError && (
-        <span className="text-[9px] text-destructive">{unlockError}</span>
+        <span className="text-[9px] text-destructive text-center">
+          {unlockError}
+        </span>
       )}
     </div>
   );
@@ -775,7 +885,7 @@ function App() {
         {isLocked ? (
           <div className="flex flex-col items-center gap-1 py-2">
             <ShieldX className="size-6 text-destructive" />
-            <span className="font-mono text-[14px] font-bold tracking-wider text-destructive challenge-pulse">
+            <span className="font-mono text-[14px] font-bold tracking-wider text-destructive">
               {formatLock(lockoutSecs)}
             </span>
             <span className="text-[8px] text-muted-foreground text-center leading-tight">
@@ -790,33 +900,24 @@ function App() {
               <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
                 {challenge.split("").map((c, i) => (
                   <span
-                    key={i}
-                    className="flex size-5 items-center justify-center rounded-sm bg-muted/40 border border-border/40"
+                    key={`${i}-${challengeExpiresAt}`}
+                    className="flex size-5 items-center justify-center rounded-[2px] bg-muted/40 border border-border/40"
                   >
                     {c}
                   </span>
                 ))}
               </div>
             </div>
-            <InputOTP
-              maxLength={PIN_LEN}
+            <span className="text-[8px] text-muted-foreground text-center leading-tight">
+              Type (PIN digit + char above) mod 36, in Base36 (0-9, A-Z).
+            </span>
+            <PinOtp
               value={unlockPin}
-              onChange={(v) => setUnlockPin(v.toUpperCase())}
-              inputMode="text"
-              pattern="[0-9A-Za-z]*"
-              containerClassName="gap-1"
+              onChange={setUnlockPin}
+              status={unlockStatus}
               autoFocus
-            >
-              <InputOTPGroup>
-                <MaskedOTPSlot index={0} status={unlockStatus} />
-                <MaskedOTPSlot index={1} status={unlockStatus} />
-              </InputOTPGroup>
-              <InputOTPSeparator />
-              <InputOTPGroup>
-                <MaskedOTPSlot index={2} status={unlockStatus} />
-                <MaskedOTPSlot index={3} status={unlockStatus} />
-              </InputOTPGroup>
-            </InputOTP>
+              disabled={unlockBusy}
+            />
             {failedAttempts > 0 && (
               <span className="text-[8px] text-muted-foreground">
                 {attemptsLeft} attempt{attemptsLeft === 1 ? "" : "s"} left
@@ -1051,6 +1152,7 @@ function App() {
           placeholder="Password"
           value={newPassword}
           onChange={(e) => setNewPassword(e.target.value)}
+          autoComplete="new-password"
           className="flex-1 min-w-0 bg-transparent px-2 text-[10px] outline-none placeholder:text-muted-foreground"
         />
       </div>
@@ -1081,11 +1183,11 @@ function App() {
   const runRekey = useCallback(async () => {
     if (!token) return;
     if (rekeyCurrentPin.length !== PIN_LEN) {
-      setRekeyError("current pin required");
+      setRekeyError(`current PIN must be ${PIN_LEN} digits`);
       return;
     }
     if (rekeyChangePin && rekeyNewPin.length !== PIN_LEN) {
-      setRekeyError("new pin must be 4 digits");
+      setRekeyError(`new PIN must be ${PIN_LEN} digits`);
       return;
     }
     setRekeyBusy(true);
@@ -1108,7 +1210,7 @@ function App() {
       setRekeyNewPin("");
       setRekeyChangePin(false);
     } catch (e) {
-      setRekeyError(String(e));
+      setRekeyError(errToText(e));
     } finally {
       setRekeyBusy(false);
     }
@@ -1227,26 +1329,12 @@ function App() {
       <span className="text-[8px] text-muted-foreground self-start">
         Current PIN
       </span>
-      <InputOTP
-        maxLength={PIN_LEN}
+      <PinOtp
         value={rekeyCurrentPin}
         onChange={setRekeyCurrentPin}
-        inputMode="numeric"
-        pattern="[0-9]*"
-        containerClassName="gap-1"
         autoFocus
         disabled={rekeyBusy}
-      >
-        <InputOTPGroup>
-          <MaskedOTPSlot index={0} />
-          <MaskedOTPSlot index={1} />
-        </InputOTPGroup>
-        <InputOTPSeparator />
-        <InputOTPGroup>
-          <MaskedOTPSlot index={2} />
-          <MaskedOTPSlot index={3} />
-        </InputOTPGroup>
-      </InputOTP>
+      />
       <label className="flex items-center gap-1 text-[9px] text-muted-foreground self-start">
         <Checkbox
           checked={rekeyChangePin}
@@ -1256,25 +1344,11 @@ function App() {
         Change PIN too
       </label>
       {rekeyChangePin && (
-        <InputOTP
-          maxLength={PIN_LEN}
+        <PinOtp
           value={rekeyNewPin}
           onChange={setRekeyNewPin}
-          inputMode="numeric"
-          pattern="[0-9]*"
-          containerClassName="gap-1"
           disabled={rekeyBusy}
-        >
-          <InputOTPGroup>
-            <MaskedOTPSlot index={0} />
-            <MaskedOTPSlot index={1} />
-          </InputOTPGroup>
-          <InputOTPSeparator />
-          <InputOTPGroup>
-            <MaskedOTPSlot index={2} />
-            <MaskedOTPSlot index={3} />
-          </InputOTPGroup>
-        </InputOTP>
+        />
       )}
       {rekeyError && (
         <span className="text-[9px] text-red-500 text-center">
@@ -1309,29 +1383,11 @@ function App() {
         Set Item PIN
       </span>
       <span className="text-[9px] text-muted-foreground text-center">
-        Choose a 4-digit PIN for
+        {PIN_LEN}-digit PIN for
         <br />
         <span className="text-foreground">{newTitle || "this item"}</span>
       </span>
-      <InputOTP
-        maxLength={PIN_LEN}
-        value={newCustomPin}
-        onChange={setNewCustomPin}
-        inputMode="numeric"
-        pattern="[0-9]*"
-        containerClassName="gap-1"
-        autoFocus
-      >
-        <InputOTPGroup>
-          <MaskedOTPSlot index={0} />
-          <MaskedOTPSlot index={1} />
-        </InputOTPGroup>
-        <InputOTPSeparator />
-        <InputOTPGroup>
-          <MaskedOTPSlot index={2} />
-          <MaskedOTPSlot index={3} />
-        </InputOTPGroup>
-      </InputOTP>
+      <PinOtp value={newCustomPin} onChange={setNewCustomPin} autoFocus />
       <Button
         size="xs"
         className="w-full mt-1"
@@ -1345,29 +1401,17 @@ function App() {
   );
 
   const actionOverlay = pendingAction && (
-    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/95 backdrop-blur-sm">
+    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/95 backdrop-blur-sm px-2.5">
       <span className="text-[9px] text-muted-foreground uppercase tracking-wider">
         Item PIN
       </span>
-      <InputOTP
-        maxLength={PIN_LEN}
+      <PinOtp
         value={actionPin}
         onChange={setActionPin}
-        inputMode="numeric"
-        pattern="[0-9]*"
-        containerClassName="gap-1"
+        status={actionStatus}
         autoFocus
-      >
-        <InputOTPGroup>
-          <MaskedOTPSlot index={0} status={actionStatus} />
-          <MaskedOTPSlot index={1} status={actionStatus} />
-        </InputOTPGroup>
-        <InputOTPSeparator />
-        <InputOTPGroup>
-          <MaskedOTPSlot index={2} status={actionStatus} />
-          <MaskedOTPSlot index={3} status={actionStatus} />
-        </InputOTPGroup>
-      </InputOTP>
+        disabled={actionBusy}
+      />
       <button
         onClick={() => {
           setPendingAction(null);
@@ -1444,9 +1488,13 @@ function App() {
     };
   }, []);
 
-  // Autolock on window blur
+  // Autolock on window blur — but only from the entry list. While the user
+  // is in a transient view (add/set-pin/settings/rekey/action overlay)
+  // losing focus shouldn't wipe their in-progress input. The session TTL
+  // still applies once they're back on the list.
   useEffect(() => {
     if (phase !== "unlocked") return;
+    if (view !== "list" || pendingAction !== null || rekeyOpen) return;
     const win = getCurrentWindow();
     const unlistenP = win.onFocusChanged(({ payload: focused }) => {
       if (!focused) doLock();
@@ -1454,7 +1502,7 @@ function App() {
     return () => {
       unlistenP.then((f) => f()).catch(() => {});
     };
-  }, [phase, doLock]);
+  }, [phase, view, pendingAction, rekeyOpen, doLock]);
 
   // Tray-triggered lock ("vault://locked" event from Rust).
   useEffect(() => {

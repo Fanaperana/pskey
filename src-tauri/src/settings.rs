@@ -2,9 +2,10 @@
 //!
 //! Non-secret config — plain JSON, atomically written, auto-created with defaults.
 
+use crate::io_util;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::{fs, io::Write};
+use std::fs;
+use std::path::Path;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -62,10 +63,6 @@ impl Settings {
     }
 }
 
-pub fn settings_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("settings.json")
-}
-
 pub fn load_or_default(path: &Path) -> Settings {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)
@@ -80,17 +77,7 @@ pub fn load_or_default(path: &Path) -> Settings {
 }
 
 pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    io_util::atomic_write(path, &bytes, false)
 }

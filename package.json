@@ -2,7 +2,7 @@
   "name": "pskey",
   "private": true,
   "version": "0.1.0",
-  "description": "Tiny transparent Tauri widget password manager (libsodium, Argon2id, challenge-response PIN).",
+  "description": "Tiny transparent Tauri widget password manager (libsodium, Argon2id, per-entry PIN encryption).",
   "author": "Fanaperana <31814043+Fanaperana@users.noreply.github.com>",
   "license": "MIT",
   "repository": {

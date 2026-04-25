@@ -1,6 +1,9 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 pub mod commands;
+pub mod device_secret;
+pub mod error;
+pub mod io_util;
 pub mod lockout;
 pub mod settings;
 pub mod vault;
@@ -28,17 +31,24 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            let vault_file = vault::vault_path(&data_dir);
-            let settings_file = settings::settings_path(&data_dir);
-            let lockout_file = lockout::lockout_path(&data_dir);
+            let vault_file = io_util::files::vault(&data_dir);
+            let settings_file = io_util::files::settings(&data_dir);
+            let lockout_file = io_util::files::lockout(&data_dir);
+            let device_secret_file = io_util::files::device_secret(&data_dir);
             // Ensure settings.json exists with defaults on first run.
             let _ = settings::load_or_default(&settings_file);
             // Restore any persisted lockout state — survives process restarts.
             let lockout_state = lockout::load(&lockout_file);
+            // Load (or generate) the per-install device secret. Mixed into
+            // every Argon2id derivation so a stolen vault file alone is
+            // useless even with a tiny 4-digit PIN.
+            let device_secret = device_secret::load_or_create(&device_secret_file)
+                .expect("failed to load or create device secret");
             app.manage(commands::AppState::new(
                 vault_file,
                 settings_file,
                 lockout_file,
+                device_secret,
                 lockout_state,
             ));
 
