@@ -31,9 +31,17 @@ Built with [Tauri](https://tauri.app) + [React](https://react.dev) + [libsodium]
 - 🪟 **Tiny widget** — 145 px transparent floating window; drag it anywhere.
 - 🔒 **Libsodium all the way down** — Argon2id + XSalsa20-Poly1305, nothing handrolled.
 - 🎭 **Challenge-response PIN** — the PIN you memorize is *never* what you type.
-- ⚡ **Async KDF** — heavy crypto runs off the UI thread, with a cheeky "Cooking…" indicator.
+- ⚡ **Async crypto** — every Argon2id call (unlock, add-entry, reveal, rekey)
+  runs off the UI thread, with a cheeky "Cooking…" indicator.
 - 🧊 **Autolock everywhere** — 30 s sliding session + instant lock on window blur.
 - 📋 **Self-wiping clipboard** — copied secrets are cleared after 15 s.
+- 🚫 **Persistent lockout** — escalating cooldowns (1 m → 24 h cap) survive
+  process kill and reboot; first lockout costs 10 attempts, every one after
+  that costs only 3.
+- 🎨 **Themes & UI scale** — 5 dark variants and 6 zoom levels, persisted in
+  `settings.json` (auto-generated with sane defaults).
+- 🔑 **Rekey on demand** — change PIN and/or KDF strength
+  (Interactive / Moderate / Sensitive) without re-entering data.
 - 🧱 **Hardened capabilities** — strict CSP, minimal Tauri permissions.
 
 ## 🔐 Security model
@@ -41,13 +49,13 @@ Built with [Tauri](https://tauri.app) + [React](https://react.dev) + [libsodium]
 | Layer               | What                                                                |
 | ------------------- | ------------------------------------------------------------------- |
 | Vault file          | `$APP_DATA/vault.bin`, atomic write with `.bak` rotation            |
-| KDF                 | Argon2id via libsodium `crypto_pwhash` (MODERATE ops / mem)         |
+| KDF                 | Argon2id via libsodium `crypto_pwhash`, strength selectable per vault (Interactive ≈ 64 MiB, Moderate ≈ 256 MiB, Sensitive ≈ 1 GiB) |
 | Cipher              | XSalsa20-Poly1305 (libsodium `secretbox`)                           |
 | Plaintext           | msgpack-encoded `VaultData`, zeroized on drop                       |
 | Per-entry PIN       | separate Argon2id salt + 32-byte hash, constant-time compare        |
 | Session             | 30 s sliding TTL, opaque 24-byte token held in Rust state only      |
 | Clipboard           | copy performed in Rust, auto-cleared after 15 s if unchanged        |
-| Rate limit          | exponential backoff after 3 failed unlocks                          |
+| Rate limit          | persistent escalating lockout: 10 attempts → 1 m, 3 m, 5 m, 10 m, 15 m, 30 m, 1 h, 3 h, 12 h, 24 h cap; only **3** attempts between lockouts; resets on success |
 | Autolock            | on window blur and on session expiry                                |
 | Front-end surface   | strict CSP, no remote assets, minimal Tauri capabilities            |
 
@@ -120,7 +128,20 @@ Rust backend:
    counted against the rate limiter, regardless of how many candidates were
    tried.
 
-## 🚀 Getting started
+## � App data layout
+
+Everything PSKey writes lives under your platform's `$APP_DATA/com.fanaperana.pskey/`:
+
+| File           | Purpose                                                                | Encrypted?       |
+| -------------- | ---------------------------------------------------------------------- | ---------------- |
+| `vault.bin`    | secrets — header (KDF params + nonce) followed by `secretbox` blob     | yes              |
+| `settings.json`| theme, UI scale, default KDF strength for new vaults                   | no (no secrets)  |
+| `lockout.json` | failed-attempt counter, current lockout level, cooldown deadline       | no (counters)    |
+
+`settings.json` and `lockout.json` are auto-created with safe defaults on
+first launch and written atomically (`*.tmp` → rename).
+
+## �🚀 Getting started
 
 ```sh
 pnpm install
@@ -153,6 +174,20 @@ cd src-tauri && cargo check   # Rust
 - [ ] Import / export (encrypted)
 - [ ] Tests for the vault format + challenge decoder
 - [ ] Accessibility pass on the tiny widget UI
+
+## 🐞 Troubleshooting
+
+**`libpthread.so.0: undefined symbol: __libc_pthread_init` on Linux.**
+This happens when WebKitGTK is launched from a Snap-installed VS Code: the
+Snap leaks `GTK_PATH` / `XDG_DATA_DIRS` pointing into `/snap/...` which
+load an incompatible glibc. Run `pnpm tauri dev` from a regular terminal
+(or install VS Code from `.deb` / Flatpak / the official repo). If you must
+launch from Snap, prefix the command with:
+
+```sh
+env -u GTK_PATH -u GTK_EXE_PREFIX -u GIO_MODULE_DIR -u GTK_IM_MODULE_FILE \
+    -u XDG_DATA_DIRS -u XDG_DATA_HOME pnpm tauri dev
+```
 
 Open to ideas — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

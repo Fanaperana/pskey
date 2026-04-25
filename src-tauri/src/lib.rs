@@ -1,6 +1,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
 pub mod commands;
+pub mod lockout;
+pub mod settings;
 pub mod vault;
 
 use tauri::{
@@ -27,7 +29,18 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
             let vault_file = vault::vault_path(&data_dir);
-            app.manage(commands::AppState::new(vault_file));
+            let settings_file = settings::settings_path(&data_dir);
+            let lockout_file = lockout::lockout_path(&data_dir);
+            // Ensure settings.json exists with defaults on first run.
+            let _ = settings::load_or_default(&settings_file);
+            // Restore any persisted lockout state — survives process restarts.
+            let lockout_state = lockout::load(&lockout_file);
+            app.manage(commands::AppState::new(
+                vault_file,
+                settings_file,
+                lockout_file,
+                lockout_state,
+            ));
 
             // ── Global shortcut: ⌘⇧P (or Ctrl+Shift+P) toggles the window ──
             #[cfg(desktop)]
@@ -36,10 +49,7 @@ pub fn run() {
                     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
                 };
 
-                let toggle = Shortcut::new(
-                    Some(Modifiers::SUPER | Modifiers::SHIFT),
-                    Code::KeyP,
-                );
+                let toggle = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyP);
 
                 app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
@@ -73,9 +83,7 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit PSKey", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_hide, &lock, &separator, &quit])?;
 
-            let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
-                "../icons/tray.png"
-            ))?;
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
             let _tray = TrayIconBuilder::with_id("pskey-tray")
                 .icon(tray_icon)
@@ -135,6 +143,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::vault_exists,
+            commands::lockout_status,
             commands::vault_init,
             commands::vault_unlock,
             commands::vault_unlock_challenge,
@@ -146,6 +155,10 @@ pub fn run() {
             commands::add_entry,
             commands::delete_entry,
             commands::copy_to_clipboard,
+            commands::settings_get,
+            commands::settings_set,
+            commands::vault_strength,
+            commands::vault_rekey,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

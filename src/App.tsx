@@ -97,6 +97,36 @@ const SESSION_TTL_MS = 30_000;
 const PIN_LEN = 4;
 const CHALLENGE_ROTATE_MS = 30_000;
 
+type Theme = "default" | "midnight" | "forest" | "mocha" | "rose";
+const THEMES: { value: Theme; label: string }[] = [
+  { value: "default", label: "Default" },
+  { value: "midnight", label: "Midnight" },
+  { value: "forest", label: "Forest" },
+  { value: "mocha", label: "Mocha" },
+  { value: "rose", label: "Rose" },
+];
+const SCALES: { value: number; label: string }[] = [
+  { value: 0.9, label: "XS" },
+  { value: 1.0, label: "S" },
+  { value: 1.1, label: "M" },
+  { value: 1.2, label: "L" },
+  { value: 1.35, label: "XL" },
+  { value: 1.5, label: "XXL" },
+];
+
+type KdfStrength = "interactive" | "moderate" | "sensitive";
+const KDF_OPTIONS: { value: KdfStrength; label: string; hint: string }[] = [
+  { value: "interactive", label: "Fast", hint: "Interactive · ~64 MiB" },
+  { value: "moderate", label: "Balanced", hint: "Moderate · ~256 MiB" },
+  { value: "sensitive", label: "Paranoid", hint: "Sensitive · ~1 GiB" },
+];
+
+interface SettingsPayload {
+  theme: Theme;
+  ui_scale: number;
+  kdf_strength: KdfStrength;
+}
+
 const BUSY_PHRASES = [
   "Cooking",
   "Computing",
@@ -175,6 +205,10 @@ function App() {
     "valid" | "invalid" | "busy" | null
   >(null);
   const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [lockoutSecs, setLockoutSecs] = useState(0);
+  const [lockoutLevel, setLockoutLevel] = useState(0);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [attemptThreshold, setAttemptThreshold] = useState(10);
   const [setupPin, setSetupPin] = useState("");
   const [challenge, setChallenge] = useState(() => generateChallenge());
   const [challengeExpiresAt, setChallengeExpiresAt] = useState(
@@ -188,6 +222,117 @@ function App() {
   const [actionStatus, setActionStatus] = useState<"valid" | "invalid" | null>(
     null
   );
+
+  const [theme, setTheme] = useState<Theme>("default");
+  const [uiScale, setUiScale] = useState<number>(1.2);
+  const [kdfStrength, setKdfStrength] = useState<KdfStrength>("interactive");
+  const [vaultStrength, setVaultStrength] = useState<KdfStrength | "unknown">(
+    "unknown"
+  );
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+
+  // Rekey dialog state.
+  const [rekeyOpen, setRekeyOpen] = useState(false);
+  const [rekeyCurrentPin, setRekeyCurrentPin] = useState("");
+  const [rekeyNewPin, setRekeyNewPin] = useState("");
+  const [rekeyTargetStrength, setRekeyTargetStrength] =
+    useState<KdfStrength>("interactive");
+  const [rekeyChangePin, setRekeyChangePin] = useState(false);
+  const [rekeyBusy, setRekeyBusy] = useState(false);
+  const [rekeyError, setRekeyError] = useState<string | null>(null);
+
+  // Load persisted settings from settings.json on mount.
+  useEffect(() => {
+    invoke<SettingsPayload>("settings_get")
+      .then((s) => {
+        setTheme(s.theme);
+        setUiScale(s.ui_scale);
+        setKdfStrength(s.kdf_strength);
+        setRekeyTargetStrength(s.kdf_strength);
+      })
+      .catch(() => {})
+      .finally(() => setSettingsLoaded(true));
+  }, []);
+
+  // Apply theme class to <html>.
+  useEffect(() => {
+    const html = document.documentElement;
+    THEMES.forEach((t) => html.classList.remove(`theme-${t.value}`));
+    if (theme !== "default") html.classList.add(`theme-${theme}`);
+  }, [theme]);
+
+  // Apply UI scale via CSS zoom on <html>.
+  useEffect(() => {
+    (document.documentElement.style as unknown as { zoom: string }).zoom =
+      String(uiScale);
+  }, [uiScale]);
+
+  // Persist to backend after initial load.
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    invoke("settings_set", {
+      settingsInput: {
+        theme,
+        ui_scale: uiScale,
+        kdf_strength: kdfStrength,
+      },
+    }).catch(() => {});
+  }, [settingsLoaded, theme, uiScale, kdfStrength]);
+
+  // After unlock, ask the backend what KDF strength the live vault uses.
+  useEffect(() => {
+    if (phase !== "unlocked" || !token) {
+      setVaultStrength("unknown");
+      return;
+    }
+    invoke<string>("vault_strength", { token })
+      .then((s) => {
+        const v = s as KdfStrength | "unknown";
+        setVaultStrength(v);
+        if (v !== "unknown") setRekeyTargetStrength(v);
+      })
+      .catch(() => setVaultStrength("unknown"));
+  }, [phase, token]);
+
+  // Pull lockout state from backend (also runs on mount so a cooldown
+  // restored from disk is reflected immediately).
+  const refreshLockout = useCallback(() => {
+    return invoke<{
+      remaining_secs: number;
+      failed_attempts: number;
+      lockout_level: number;
+      threshold: number;
+    }>("lockout_status")
+      .then((s) => {
+        setLockoutSecs(s.remaining_secs);
+        setFailedAttempts(s.failed_attempts);
+        setLockoutLevel(s.lockout_level);
+        setAttemptThreshold(s.threshold);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshLockout();
+  }, [refreshLockout]);
+
+  // While locked, decrement the local counter every second so the UI shows a
+  // live countdown without hammering the backend.
+  useEffect(() => {
+    if (lockoutSecs <= 0) return;
+    const iv = window.setInterval(() => {
+      setLockoutSecs((s) => {
+        if (s <= 1) {
+          // Cooldown just hit zero — re-sync with backend so threshold and
+          // attempt counters reflect the post-lockout state (3 attempts).
+          window.setTimeout(() => refreshLockout(), 0);
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(iv);
+  }, [lockoutSecs, refreshLockout]);
 
   const touchSession = useCallback(() => {
     setExpiresAt(Date.now() + SESSION_TTL_MS);
@@ -250,6 +395,7 @@ function App() {
 
   useEffect(() => {
     if (phase !== "locked" || unlockPin.length !== PIN_LEN) return;
+    if (lockoutSecs > 0) return;
     setUnlockStatus("busy");
     setBusyPhrase(pickBusyPhrase());
     invoke<UnlockResult>("vault_unlock_challenge", {
@@ -267,6 +413,7 @@ function App() {
           setUnlockError(null);
           setPhase("unlocked");
         }, 200);
+        refreshLockout();
       })
       .catch((e) => {
         setUnlockStatus("invalid");
@@ -276,6 +423,7 @@ function App() {
           setUnlockPin("");
           setUnlockStatus(null);
         }, 600);
+        refreshLockout();
       });
   }, [phase, unlockPin]);
 
@@ -550,8 +698,6 @@ function App() {
       </span>
       <span className="text-[9px] text-muted-foreground text-center">
         Choose a 4-digit PIN.
-        <br />
-        Argon2id + libsodium.
       </span>
       <InputOTP
         maxLength={PIN_LEN}
@@ -603,48 +749,87 @@ function App() {
   );
 
   const lockedView = (() => {
+    const isLocked = lockoutSecs > 0;
+    const formatLock = (s: number) => {
+      if (s >= 3600) {
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        return `${h}h ${m.toString().padStart(2, "0")}m ${sec
+          .toString()
+          .padStart(2, "0")}s`;
+      }
+      if (s >= 60) {
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        return `${m}:${sec.toString().padStart(2, "0")}`;
+      }
+      return `${s}s`;
+    };
+    const attemptsLeft = Math.max(0, attemptThreshold - failedAttempts);
     return (
-    <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
-      <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
-        Unlock
-      </span>
-      <div className="inline-flex">
-        <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
-          {challenge.split("").map((c, i) => (
-            <span
-              key={i}
-              className="flex size-5 items-center justify-center rounded-sm bg-muted/40 border border-border/40"
-            >
-              {c}
-            </span>
-          ))}
-        </div>
-      </div>
-      <InputOTP
-        maxLength={PIN_LEN}
-        value={unlockPin}
-        onChange={(v) => setUnlockPin(v.toUpperCase())}
-        inputMode="text"
-        pattern="[0-9A-Za-z]*"
-        containerClassName="gap-1"
-        autoFocus
-      >
-        <InputOTPGroup>
-          <MaskedOTPSlot index={0} status={unlockStatus} />
-          <MaskedOTPSlot index={1} status={unlockStatus} />
-        </InputOTPGroup>
-        <InputOTPSeparator />
-        <InputOTPGroup>
-          <MaskedOTPSlot index={2} status={unlockStatus} />
-          <MaskedOTPSlot index={3} status={unlockStatus} />
-        </InputOTPGroup>
-      </InputOTP>
-      {unlockError && (
-        <span className="text-[9px] text-destructive text-center">
-          {unlockError}
+      <div className="px-2.5 py-3 flex flex-col items-center gap-1.5">
+        <span className="text-[10px] font-semibold text-muted-foreground tracking-wider uppercase">
+          {isLocked ? "Locked Out" : "Unlock"}
         </span>
-      )}
-    </div>
+        {isLocked ? (
+          <div className="flex flex-col items-center gap-1 py-2">
+            <ShieldX className="size-6 text-destructive" />
+            <span className="font-mono text-[14px] font-bold tracking-wider text-destructive challenge-pulse">
+              {formatLock(lockoutSecs)}
+            </span>
+            <span className="text-[8px] text-muted-foreground text-center leading-tight">
+              Lockout #{lockoutLevel}
+              <br />
+              Next budget: {lockoutLevel >= 1 ? 3 : 10} attempts
+            </span>
+          </div>
+        ) : (
+          <>
+            <div className="inline-flex">
+              <div className="flex gap-0.5 font-mono text-[11px] font-bold tracking-[0.15em]">
+                {challenge.split("").map((c, i) => (
+                  <span
+                    key={i}
+                    className="flex size-5 items-center justify-center rounded-sm bg-muted/40 border border-border/40"
+                  >
+                    {c}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <InputOTP
+              maxLength={PIN_LEN}
+              value={unlockPin}
+              onChange={(v) => setUnlockPin(v.toUpperCase())}
+              inputMode="text"
+              pattern="[0-9A-Za-z]*"
+              containerClassName="gap-1"
+              autoFocus
+            >
+              <InputOTPGroup>
+                <MaskedOTPSlot index={0} status={unlockStatus} />
+                <MaskedOTPSlot index={1} status={unlockStatus} />
+              </InputOTPGroup>
+              <InputOTPSeparator />
+              <InputOTPGroup>
+                <MaskedOTPSlot index={2} status={unlockStatus} />
+                <MaskedOTPSlot index={3} status={unlockStatus} />
+              </InputOTPGroup>
+            </InputOTP>
+            {failedAttempts > 0 && (
+              <span className="text-[8px] text-muted-foreground">
+                {attemptsLeft} attempt{attemptsLeft === 1 ? "" : "s"} left
+              </span>
+            )}
+            {unlockError && (
+              <span className="text-[9px] text-destructive text-center">
+                {unlockError}
+              </span>
+            )}
+          </>
+        )}
+      </div>
     );
   })();
 
@@ -893,16 +1078,228 @@ function App() {
     </div>
   );
 
+  const runRekey = useCallback(async () => {
+    if (!token) return;
+    if (rekeyCurrentPin.length !== PIN_LEN) {
+      setRekeyError("current pin required");
+      return;
+    }
+    if (rekeyChangePin && rekeyNewPin.length !== PIN_LEN) {
+      setRekeyError("new pin must be 4 digits");
+      return;
+    }
+    setRekeyBusy(true);
+    setRekeyError(null);
+    try {
+      const r = await invoke<UnlockResult>("vault_rekey", {
+        token,
+        input: {
+          current_pin: rekeyCurrentPin,
+          new_pin: rekeyChangePin ? rekeyNewPin : null,
+          strength: rekeyTargetStrength,
+        },
+      });
+      setToken(r.token);
+      setEntries(r.entries);
+      setExpiresAt(Date.now() + r.expires_in_ms);
+      setVaultStrength(rekeyTargetStrength);
+      setRekeyOpen(false);
+      setRekeyCurrentPin("");
+      setRekeyNewPin("");
+      setRekeyChangePin(false);
+    } catch (e) {
+      setRekeyError(String(e));
+    } finally {
+      setRekeyBusy(false);
+    }
+  }, [
+    token,
+    rekeyCurrentPin,
+    rekeyNewPin,
+    rekeyChangePin,
+    rekeyTargetStrength,
+  ]);
+
   const settingsView = (
-    <div className="flex flex-col items-center justify-center px-2.5 py-4 gap-1">
-      <span className="text-[10px] text-muted-foreground">Encrypted with</span>
-      <span className="text-[9px] font-semibold text-center">
-        Argon2id +<br />XSalsa20-Poly1305
+    <div className="flex flex-col items-center justify-center px-2.5 py-3 gap-2">
+      <div className="w-full flex flex-col gap-1">
+        <label className="text-[9px] uppercase tracking-wider text-muted-foreground">
+          Theme
+        </label>
+        <select
+          value={theme}
+          onChange={(e) => setTheme(e.target.value as Theme)}
+          className="w-full text-[10px] bg-input/30 border border-input rounded-sm px-1.5 py-1 outline-none focus:ring-1 focus:ring-ring/50"
+        >
+          {THEMES.map((t) => (
+            <option key={t.value} value={t.value}>
+              {t.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="w-full flex flex-col gap-1">
+        <label className="text-[9px] uppercase tracking-wider text-muted-foreground">
+          UI Scale
+        </label>
+        <select
+          value={String(uiScale)}
+          onChange={(e) => setUiScale(Number(e.target.value))}
+          className="w-full text-[10px] bg-input/30 border border-input rounded-sm px-1.5 py-1 outline-none focus:ring-1 focus:ring-ring/50"
+        >
+          {SCALES.map((s) => (
+            <option key={s.value} value={s.value}>
+              {s.label} ({s.value}×)
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="w-full flex flex-col gap-1">
+        <label className="text-[9px] uppercase tracking-wider text-muted-foreground">
+          KDF (new vaults)
+        </label>
+        <select
+          value={kdfStrength}
+          onChange={(e) => setKdfStrength(e.target.value as KdfStrength)}
+          className="w-full text-[10px] bg-input/30 border border-input rounded-sm px-1.5 py-1 outline-none focus:ring-1 focus:ring-ring/50"
+        >
+          {KDF_OPTIONS.map((k) => (
+            <option key={k.value} value={k.value}>
+              {k.label} — {k.hint}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="flex flex-col items-center mt-1 gap-0.5">
+        <span className="text-[9px] text-muted-foreground">
+          Vault: {vaultStrength === "unknown" ? "custom" : vaultStrength}
+        </span>
+        <span className="text-[9px] font-semibold text-center">
+          Argon2id +<br />XSalsa20-Poly1305
+        </span>
+      </div>
+      <div className="flex gap-1.5 mt-1">
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={() => {
+            setRekeyError(null);
+            setRekeyCurrentPin("");
+            setRekeyNewPin("");
+            setRekeyChangePin(false);
+            setRekeyOpen(true);
+          }}
+        >
+          <span className="text-[10px]">Rekey</span>
+        </Button>
+        <Button size="xs" variant="outline" onClick={doLock}>
+          <Lock className="size-3 mr-1" />
+          <span className="text-[10px]">Lock</span>
+        </Button>
+      </div>
+    </div>
+  );
+
+  const rekeyOverlay = rekeyOpen && (
+    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-1.5 bg-background/95 backdrop-blur-sm px-2.5 py-3">
+      <span className="text-[9px] text-muted-foreground uppercase tracking-wider">
+        Rekey Vault
       </span>
-      <Button size="xs" variant="outline" className="mt-2" onClick={doLock}>
-        <Lock className="size-3 mr-1" />
-        <span className="text-[10px]">Lock Now</span>
-      </Button>
+      <div className="w-full flex flex-col gap-0.5">
+        <label className="text-[8px] uppercase tracking-wider text-muted-foreground">
+          Strength
+        </label>
+        <select
+          value={rekeyTargetStrength}
+          onChange={(e) =>
+            setRekeyTargetStrength(e.target.value as KdfStrength)
+          }
+          className="w-full text-[10px] bg-input/30 border border-input rounded-sm px-1.5 py-1 outline-none"
+          disabled={rekeyBusy}
+        >
+          {KDF_OPTIONS.map((k) => (
+            <option key={k.value} value={k.value}>
+              {k.label} — {k.hint}
+            </option>
+          ))}
+        </select>
+      </div>
+      <span className="text-[8px] text-muted-foreground self-start">
+        Current PIN
+      </span>
+      <InputOTP
+        maxLength={PIN_LEN}
+        value={rekeyCurrentPin}
+        onChange={setRekeyCurrentPin}
+        inputMode="numeric"
+        pattern="[0-9]*"
+        containerClassName="gap-1"
+        autoFocus
+        disabled={rekeyBusy}
+      >
+        <InputOTPGroup>
+          <MaskedOTPSlot index={0} />
+          <MaskedOTPSlot index={1} />
+        </InputOTPGroup>
+        <InputOTPSeparator />
+        <InputOTPGroup>
+          <MaskedOTPSlot index={2} />
+          <MaskedOTPSlot index={3} />
+        </InputOTPGroup>
+      </InputOTP>
+      <label className="flex items-center gap-1 text-[9px] text-muted-foreground self-start">
+        <Checkbox
+          checked={rekeyChangePin}
+          onCheckedChange={(v) => setRekeyChangePin(Boolean(v))}
+          disabled={rekeyBusy}
+        />
+        Change PIN too
+      </label>
+      {rekeyChangePin && (
+        <InputOTP
+          maxLength={PIN_LEN}
+          value={rekeyNewPin}
+          onChange={setRekeyNewPin}
+          inputMode="numeric"
+          pattern="[0-9]*"
+          containerClassName="gap-1"
+          disabled={rekeyBusy}
+        >
+          <InputOTPGroup>
+            <MaskedOTPSlot index={0} />
+            <MaskedOTPSlot index={1} />
+          </InputOTPGroup>
+          <InputOTPSeparator />
+          <InputOTPGroup>
+            <MaskedOTPSlot index={2} />
+            <MaskedOTPSlot index={3} />
+          </InputOTPGroup>
+        </InputOTP>
+      )}
+      {rekeyError && (
+        <span className="text-[9px] text-red-500 text-center">
+          {rekeyError}
+        </span>
+      )}
+      <div className="flex gap-1.5 mt-0.5">
+        <Button
+          size="xs"
+          onClick={runRekey}
+          disabled={rekeyBusy || rekeyCurrentPin.length !== PIN_LEN}
+        >
+          <span className="text-[10px]">
+            {rekeyBusy ? "Working…" : "Apply"}
+          </span>
+        </Button>
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={() => setRekeyOpen(false)}
+          disabled={rekeyBusy}
+        >
+          <span className="text-[10px]">Cancel</span>
+        </Button>
+      </div>
     </div>
   );
 
@@ -1094,6 +1491,7 @@ function App() {
       {phase === "unlocked" && view === "settings" && settingsView}
       {phase === "unlocked" && view === "set-pin" && setPinView}
       {actionOverlay}
+      {rekeyOverlay}
     </div>
   );
 }

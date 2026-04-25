@@ -15,7 +15,9 @@ use dryoc::classic::crypto_secretbox::{
     crypto_secretbox_easy, crypto_secretbox_open_easy, Key as SbKey, Nonce as SbNonce,
 };
 use dryoc::constants::{
-    CRYPTO_PWHASH_MEMLIMIT_MODERATE, CRYPTO_PWHASH_OPSLIMIT_MODERATE, CRYPTO_PWHASH_SALTBYTES,
+    CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE, CRYPTO_PWHASH_MEMLIMIT_MODERATE,
+    CRYPTO_PWHASH_MEMLIMIT_SENSITIVE, CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE,
+    CRYPTO_PWHASH_OPSLIMIT_MODERATE, CRYPTO_PWHASH_OPSLIMIT_SENSITIVE, CRYPTO_PWHASH_SALTBYTES,
     CRYPTO_SECRETBOX_KEYBYTES, CRYPTO_SECRETBOX_MACBYTES, CRYPTO_SECRETBOX_NONCEBYTES,
 };
 use dryoc::rng::copy_randombytes;
@@ -136,15 +138,73 @@ pub struct VaultHeader {
     pub memlimit: u64,
 }
 
+/// KDF cost preset. Stored per-vault via `(opslimit, memlimit)` in the header.
+///
+/// - `Interactive` ≈ libsodium INTERACTIVE — recommended for short-PIN logins
+///   on user hardware. ~64 MiB / 2 ops. Fast enough for a widget.
+/// - `Moderate`    ≈ libsodium MODERATE    — heavier; ~256 MiB / 3 ops.
+/// - `Sensitive`   ≈ libsodium SENSITIVE   — paranoid mode; ~1 GiB / 4 ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KdfStrength {
+    Interactive,
+    Moderate,
+    Sensitive,
+}
+
+impl KdfStrength {
+    pub fn params(self) -> (u64, u64) {
+        match self {
+            KdfStrength::Interactive => (
+                CRYPTO_PWHASH_OPSLIMIT_INTERACTIVE as u64,
+                CRYPTO_PWHASH_MEMLIMIT_INTERACTIVE as u64,
+            ),
+            KdfStrength::Moderate => (
+                CRYPTO_PWHASH_OPSLIMIT_MODERATE as u64,
+                CRYPTO_PWHASH_MEMLIMIT_MODERATE as u64,
+            ),
+            KdfStrength::Sensitive => (
+                CRYPTO_PWHASH_OPSLIMIT_SENSITIVE as u64,
+                CRYPTO_PWHASH_MEMLIMIT_SENSITIVE as u64,
+            ),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "interactive" => Some(KdfStrength::Interactive),
+            "moderate" => Some(KdfStrength::Moderate),
+            "sensitive" => Some(KdfStrength::Sensitive),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KdfStrength::Interactive => "interactive",
+            KdfStrength::Moderate => "moderate",
+            KdfStrength::Sensitive => "sensitive",
+        }
+    }
+}
+
 impl VaultHeader {
-    pub fn new_random() -> Self {
+    /// Create a fresh header with random salt at the given KDF strength.
+    pub fn new_with_strength(strength: KdfStrength) -> Self {
         let mut salt = [0u8; SALT_LEN];
         copy_randombytes(&mut salt);
+        let (opslimit, memlimit) = strength.params();
         Self {
             salt,
-            opslimit: CRYPTO_PWHASH_OPSLIMIT_MODERATE as u64,
-            memlimit: CRYPTO_PWHASH_MEMLIMIT_MODERATE as u64,
+            opslimit,
+            memlimit,
         }
+    }
+
+    /// Default for fresh vaults — INTERACTIVE balances security and UX for a
+    /// short-PIN widget. Existing vaults keep whatever strength is stored
+    /// in their on-disk header.
+    pub fn new_random() -> Self {
+        Self::new_with_strength(KdfStrength::Interactive)
     }
 }
 
@@ -256,11 +316,11 @@ pub fn vault_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("vault.bin")
 }
 
-pub fn hash_entry_pin(pin: &str) -> Result<PinHash> {
+/// Hash a per-entry PIN at the given KDF cost. Cost is stored alongside the
+/// hash so verification reproduces the same parameters.
+pub fn hash_entry_pin_with(pin: &str, opslimit: u64, memlimit: u64) -> Result<PinHash> {
     let mut salt = [0u8; SALT_LEN];
     copy_randombytes(&mut salt);
-    let opslimit = CRYPTO_PWHASH_OPSLIMIT_MODERATE as u64;
-    let memlimit = CRYPTO_PWHASH_MEMLIMIT_MODERATE as u64;
     let mut hash = [0u8; 32];
     crypto_pwhash(
         &mut hash,
@@ -277,6 +337,12 @@ pub fn hash_entry_pin(pin: &str) -> Result<PinHash> {
         opslimit,
         memlimit,
     })
+}
+
+/// Convenience wrapper at INTERACTIVE strength.
+pub fn hash_entry_pin(pin: &str) -> Result<PinHash> {
+    let (ops, mem) = KdfStrength::Interactive.params();
+    hash_entry_pin_with(pin, ops, mem)
 }
 
 pub fn verify_entry_pin(record: &PinHash, pin: &str) -> bool {
